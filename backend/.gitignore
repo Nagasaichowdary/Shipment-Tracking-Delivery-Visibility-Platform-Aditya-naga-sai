@@ -1,0 +1,18 @@
+# IntelliJ
+.idea/
+*.iml
+
+# Maven
+target/
+
+# Node
+node_modules/
+
+# Archives
+*.zip
+
+# Logs
+*.log
+
+# Environment
+.env

@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 32 32" fill="none">
+  <!-- Box lid (top panel) -->
+  <rect x="3" y="5" width="26" height="8" rx="2" fill="#FBBF24" stroke="#92400E" stroke-width="1.5"/>
+  <!-- Box body (front panel) -->
+  <rect x="3" y="12" width="26" height="18" rx="2" fill="#F59E0B" stroke="#92400E" stroke-width="1.5"/>
+  <!-- Lid / body dividing line -->
+  <line x1="3" y1="13" x2="29" y2="13" stroke="#92400E" stroke-width="1.5"/>
+  <!-- Tape stripe on lid -->
+  <rect x="13" y="5" width="6" height="8" fill="white" opacity="0.45"/>
+  <!-- Tape stripe on body -->
+  <rect x="13" y="12" width="6" height="18" fill="white" opacity="0.45"/>
+  <!-- Lid tab (centre crease line) -->
+  <line x1="16" y1="5" x2="16" y2="13" stroke="#92400E" stroke-width="0.75" opacity="0.5"/>
+</svg>
