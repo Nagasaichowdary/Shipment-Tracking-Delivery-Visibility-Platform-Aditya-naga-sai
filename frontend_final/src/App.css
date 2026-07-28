@@ -759,6 +759,11 @@ a {
   position: relative;
   display: flex;
   align-items: center;
+  /* Lift this stacking context above the Leaflet MapContainer (z-index ~0–700).
+     Without this, even a high z-index on .notification-popover is ineffective
+     because the popover is a descendant of this wrapper, and a descendant can
+     never paint above a sibling stacking context that is higher in the order. */
+  z-index: 9999;
 }
 
 /* Bell trigger button */
@@ -801,12 +806,10 @@ a {
   pointer-events: none;
 }
 
-/* Dropdown popover */
+/* Dropdown popover — position/top/right/z-index are set via inline styles
+   by the React Portal in NotificationBell.jsx (position:fixed, z-index:9999).
+   Only visual styles live here. */
 .notification-popover {
-  position: absolute;
-  top: calc(100% + 10px);
-  right: 0;
-  z-index: 200;
   width: 340px;
   max-height: 440px;
   display: flex;
@@ -817,6 +820,7 @@ a {
   box-shadow: 0 8px 32px rgba(20, 33, 61, 0.13);
   overflow: hidden;
 }
+
 
 /* Popover header */
 .notification-popover-header {

@@ -1,18 +1,19 @@
 /**
  * ShipmentMap — Reusable OpenStreetMap (Leaflet) component for Shipment Tracker Pro.
  *
- * Migrated from Google Maps to React Leaflet + OpenStreetMap tiles.
+ * Uses React Leaflet + OpenStreetMap tiles.
+ * No API key required. No external routing API.
+ *
  * ─── Component API (name, props, default export) is UNCHANGED ──────────────
  * TrackShipment.jsx requires NO modifications.
  *
- * Route visualization (enhanced):
- *  • Completed segment (origin → driver)     — real road geometry, gray dashed.
- *  • Remaining segment (driver → destination) — real road geometry, bold blue.
- *  • Road geometry is fetched from the free OSRM public API (no key required).
- *  • Falls back to straight-line polylines when OSRM is unreachable or GPS unavailable.
+ * Route visualization:
+ *  • Driver live     → Completed segment (Origin → Driver, gray dashed, weight 5)
+ *                       Remaining segment (Driver → Destination, bold blue, weight 6)
+ *  • No driver GPS   → Full route (Origin → Destination, blue, weight 5)
  *
- * All markers, ETA panel, legend, Haversine calculations, and business logic
- * are completely unchanged.
+ * All coordinates are straight-line great-circle paths — guaranteed always
+ * visible. No async fetch means no race conditions or CORS failures.
  *
  * Props (unchanged)
  * ──────────────────
@@ -23,11 +24,10 @@
  * shipmentStatus    string    – reserved for future use
  */
 
-import { useCallback, useEffect, useMemo, useRef, useState } from "react";
+import { useEffect, useMemo, useRef, useState } from "react";
 import { MapContainer, TileLayer, Marker, Polyline, useMap } from "react-leaflet";
 import L from "leaflet";
 import "leaflet/dist/leaflet.css";
-import polylineCodec from "@mapbox/polyline";
 import { getCityCoordinates, estimateRoute } from "../../utils/cityCoordinates";
 
 // ── Fix Leaflet default icon URLs broken by Vite bundling ─────────────────
@@ -49,79 +49,30 @@ const MAP_CONTAINER_STYLE = {
   overflow:     "hidden",
 };
 
-const INDIA_CENTER = [20.5937, 78.9629];
+const INDIA_CENTER = [20.5937, 78.9629]; // Geographical centre of India
 
 // ── Route polyline styles ──────────────────────────────────────────────────
-// Completed segment: gray dashed — "ground already covered".
+// Completed route (Origin → Driver): gray dashed — ground already covered.
 const COMPLETED_PATH_OPTIONS = {
-  color:     "#94a3b8",
-  weight:    3,
-  opacity:   0.7,
-  dashArray: "8 6",
+  color:     "#64748b",  // slate-500
+  weight:    5,
+  dashArray: "10 6",
+  opacity:   0.9,
 };
 
-// Remaining segment: bold solid blue — "the road ahead".
+// Remaining route (Driver → Destination): bold solid blue — the road ahead.
 const REMAINING_PATH_OPTIONS = {
-  color:   "#2563eb",
-  weight:  4,
-  opacity: 0.88,
+  color:   "#2563eb",   // blue-600
+  weight:  6,
+  opacity: 1.0,
 };
 
-// Fallback (no driver GPS): single blue line.
+// Full route (no driver GPS): single blue line origin → destination.
 const FULL_PATH_OPTIONS = {
   color:   "#2563eb",
-  weight:  3,
-  opacity: 0.75,
+  weight:  5,
+  opacity: 0.85,
 };
-
-// ── OSRM road-route fetcher ────────────────────────────────────────────────
-// Uses the free OSRM demo server — no API key, no billing.
-// Returns an array of [lat, lng] pairs representing the road geometry,
-// or null on any network / parsing error.
-const OSRM_BASE = "https://router.project-osrm.org/route/v1/driving";
-
-async function fetchRoadRoute(from, to, signal) {
-  // OSRM coordinate order is lng,lat (GeoJSON convention).
-  const url =
-    `${OSRM_BASE}/${from.lng},${from.lat};${to.lng},${to.lat}` +
-    `?overview=full&geometries=polyline`;
-  try {
-    const res = await fetch(url, { signal });
-    if (!res.ok) return null;
-    const json = await res.json();
-    if (json.code !== "Ok" || !json.routes?.[0]?.geometry) return null;
-    // Decode the encoded polyline string → [[lat, lng], …]
-    return polylineCodec.decode(json.routes[0].geometry);
-  } catch {
-    return null; // AbortError or network failure → silent fallback
-  }
-}
-
-// ── Haversine distance between two [lat, lng] points (km) ─────────────────
-// Used to find the nearest point on the road geometry to the driver's GPS fix,
-// so we can split the full-route array into completed and remaining arrays.
-function haversinePair([lat1, lng1], [lat2, lng2]) {
-  const R  = 6371;
-  const dLat = ((lat2 - lat1) * Math.PI) / 180;
-  const dLng = ((lng2 - lng1) * Math.PI) / 180;
-  const a =
-    Math.sin(dLat / 2) ** 2 +
-    Math.cos((lat1 * Math.PI) / 180) *
-      Math.cos((lat2 * Math.PI) / 180) *
-      Math.sin(dLng / 2) ** 2;
-  return R * 2 * Math.atan2(Math.sqrt(a), Math.sqrt(1 - a));
-}
-
-// Find the index in `routePoints` closest to `driverPoint [lat, lng]`.
-function nearestIndex(routePoints, driverPoint) {
-  let best = 0;
-  let bestDist = Infinity;
-  for (let i = 0; i < routePoints.length; i++) {
-    const d = haversinePair(routePoints[i], driverPoint);
-    if (d < bestDist) { bestDist = d; best = i; }
-  }
-  return best;
-}
 
 // ── Emoji DivIcon factory ──────────────────────────────────────────────────
 function buildEmojiIcon(emoji, size = 22) {
@@ -133,7 +84,7 @@ function buildEmojiIcon(emoji, size = 22) {
   });
 }
 
-// ── Pulsing driver icon (orange animated ring) ─────────────────────────────
+// ── Pulsing driver icon ────────────────────────────────────────────────────
 const DRIVER_ICON_SIZE = 36;
 const DRIVER_ICON = L.divIcon({
   html: `
@@ -181,15 +132,27 @@ const ICONS = {
 };
 
 // ── MapBoundsController ────────────────────────────────────────────────────
-function MapBoundsController({ points }) {
+// fitKey is derived ONLY from originCity:destinationCity — never from GPS.
+// This ensures fitBounds() fires exactly once per new shipment, preserving
+// the user's manual zoom level between GPS poll ticks.
+function MapBoundsController({ points, fitKey }) {
   const map = useMap();
+  const lastFitKeyRef = useRef(null);
+
   useEffect(() => {
+    if (!fitKey || fitKey === lastFitKeyRef.current) return;
+
     const valid = points.filter(Boolean);
     if (valid.length === 0) return;
+
     const bounds = L.latLngBounds(valid);
-    if (bounds.isValid()) map.fitBounds(bounds, { padding: [60, 60] });
+    if (bounds.isValid()) {
+      map.fitBounds(bounds, { padding: [60, 60] });
+      lastFitKeyRef.current = fitKey;
+    }
   // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, [map, points]);
+  }, [map, points, fitKey]);
+
   return null;
 }
 
@@ -201,22 +164,18 @@ export default function ShipmentMap({
   destinationCity,
   shipmentStatus, // reserved
 }) {
-  const [cityError,      setCityError]      = useState(null);
-  // Road geometry for the full origin→destination route (array of [lat,lng]).
-  const [fullRouteGeo,   setFullRouteGeo]   = useState(null);
-  // Road geometry for driver→destination remaining route.
-  const [remainingGeo,   setRemainingGeo]   = useState(null);
+  const [cityError, setCityError] = useState(null);
 
-  // AbortController refs so we can cancel stale in-flight requests.
-  const fullAbortRef      = useRef(null);
-  const remainingAbortRef = useRef(null);
-
-  // ── Static city coords (unchanged) ────────────────────────────────────────
+  // ── Resolve city coordinates (static lookup — synchronous, no API) ─────────
   const originCoords = getCityCoordinates(originCity);
   const destCoords   = getCityCoordinates(destinationCity);
-  const driverLive   = driverLocation?.latitude != null && driverLocation?.longitude != null;
 
-  // ── City lookup errors (unchanged) ────────────────────────────────────────
+  // True only when driver has a valid GPS fix from the 5-second poll.
+  const driverLive =
+    driverLocation?.latitude  != null &&
+    driverLocation?.longitude != null;
+
+  // ── City lookup error reporting ────────────────────────────────────────────
   useEffect(() => {
     const errors = [];
     if (originCity      && !originCoords) errors.push(`Coordinates unavailable for '${originCity}'.`);
@@ -224,7 +183,7 @@ export default function ShipmentMap({
     setCityError(errors.length ? errors.join(" ") : null);
   }, [originCity, destinationCity, originCoords, destCoords]);
 
-  // ── Haversine route estimates (unchanged — used for ETA/distance panel) ───
+  // ── Haversine ETA / distance (unchanged — only for the info panel) ─────────
   const routeInfo = useMemo(() => {
     if (!originCoords || !destCoords) return null;
     return estimateRoute(originCoords, destCoords);
@@ -238,79 +197,44 @@ export default function ShipmentMap({
     );
   }, [driverLive, driverLocation, destCoords]);
 
-  // ── Fetch full road route: origin → destination ───────────────────────────
-  // Re-fetches only when origin/destination cities change (not on every GPS tick).
-  useEffect(() => {
-    if (!originCoords || !destCoords) { setFullRouteGeo(null); return; }
+  // ── Polyline coordinates ────────────────────────────────────────────────────
+  //
+  // All coordinates are pre-computed synchronously — no async fetch, no CORS
+  // dependency, no race conditions. Routes are always visible immediately.
+  //
+  // Leaflet expects positions as [[lat, lng], [lat, lng], …].
+  // originCoords / destCoords come from getCityCoordinates() → { lat, lng }.
+  // driverLocation from the backend → { latitude, longitude }.
+  //
+  // completedPath  — Origin → Driver  (rendered when driver GPS is live)
+  // remainingPath  — Driver → Destination (rendered when driver GPS is live)
+  // fullPath       — Origin → Destination (rendered when driver GPS unavailable)
 
-    if (fullAbortRef.current) fullAbortRef.current.abort();
-    fullAbortRef.current = new AbortController();
-
-    fetchRoadRoute(originCoords, destCoords, fullAbortRef.current.signal).then(geo => {
-      setFullRouteGeo(geo); // null on error → falls back to straight line
-    });
-
-    return () => fullAbortRef.current?.abort();
-  }, [originCoords, destCoords]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  // ── Fetch remaining road route: driver → destination ─────────────────────
-  // Re-fetches on every driver GPS update (every 5-second poll tick).
-  // Uses AbortController so a stale request never overwrites a newer one.
-  const fetchRemaining = useCallback(async () => {
-    if (!driverLive || !destCoords) { setRemainingGeo(null); return; }
-    if (remainingAbortRef.current) remainingAbortRef.current.abort();
-    remainingAbortRef.current = new AbortController();
-    const geo = await fetchRoadRoute(
-      { lat: driverLocation.latitude, lng: driverLocation.longitude },
-      destCoords,
-      remainingAbortRef.current.signal
-    );
-    setRemainingGeo(geo);
-  }, [driverLive, driverLocation, destCoords]); // eslint-disable-line react-hooks/exhaustive-deps
-
-  useEffect(() => {
-    fetchRemaining();
-    return () => remainingAbortRef.current?.abort();
-  }, [fetchRemaining]);
-
-  // ── Derive completed route from full geometry + remaining fetch ───────────
-  // Strategy: the "completed" segment = everything in fullRouteGeo up to the
-  // point nearest to the driver's current GPS position.
-  // This avoids a third OSRM call and keeps the two polylines perfectly joined.
-  const completedGeo = useMemo(() => {
-    if (!driverLive || !fullRouteGeo || fullRouteGeo.length < 2) return null;
-    const driverPt = [driverLocation.latitude, driverLocation.longitude];
-    const idx = nearestIndex(fullRouteGeo, driverPt);
-    // Include the driver's position itself as the final point so the segments connect.
-    return [...fullRouteGeo.slice(0, idx + 1), driverPt];
-  }, [driverLive, driverLocation, fullRouteGeo]);
-
-  // ── Straight-line fallbacks (used when OSRM data is not yet loaded) ───────
-  const straightCompleted = useMemo(() => {
+  const completedPath = useMemo(() => {
     if (!driverLive || !originCoords) return null;
-    return [[originCoords.lat, originCoords.lng], [driverLocation.latitude, driverLocation.longitude]];
+    return [
+      [originCoords.lat, originCoords.lng],
+      [Number(driverLocation.latitude), Number(driverLocation.longitude)],
+    ];
   }, [driverLive, driverLocation, originCoords]);
 
-  const straightRemaining = useMemo(() => {
+  const remainingPath = useMemo(() => {
     if (!driverLive || !destCoords) return null;
-    return [[driverLocation.latitude, driverLocation.longitude], [destCoords.lat, destCoords.lng]];
+    return [
+      [Number(driverLocation.latitude), Number(driverLocation.longitude)],
+      [destCoords.lat, destCoords.lng],
+    ];
   }, [driverLive, driverLocation, destCoords]);
 
-  const straightFull = useMemo(() => {
+  const fullPath = useMemo(() => {
     if (driverLive || !originCoords || !destCoords) return null;
-    return [[originCoords.lat, originCoords.lng], [destCoords.lat, destCoords.lng]];
+    return [
+      [originCoords.lat, originCoords.lng],
+      [destCoords.lat, destCoords.lng],
+    ];
   }, [driverLive, originCoords, destCoords]);
 
-  // Which polyline arrays to actually render:
-  //   • If driver is live: completed + remaining (road if available, straight fallback otherwise)
-  //   • If no driver: full route (road if available, straight fallback otherwise)
-  const completedPath = completedGeo  ?? straightCompleted;
-  const remainingPath = remainingGeo  ?? straightRemaining;
-  const fullPath      = fullRouteGeo
-    ? (driverLive ? null : fullRouteGeo)  // don't draw full route when driver is live
-    : straightFull;
-
-  // ── Bounds points (unchanged — covers origin, dest, driver, parcel) ────────
+  // ── Bounds points (origin, destination, driver, parcel) ───────────────────
   const boundsPoints = useMemo(() => {
     const pts = [];
     if (originCoords)                       pts.push([originCoords.lat,          originCoords.lng]);
@@ -320,7 +244,12 @@ export default function ShipmentMap({
     return pts;
   }, [originCoords, destCoords, driverLive, driverLocation, shipmentLocation]);
 
-  // ── Initial map centre (unchanged) ────────────────────────────────────────
+  // fitKey changes only when origin/destination cities change — NOT on GPS ticks.
+  const fitKey = originCity && destinationCity
+    ? `${originCity}:${destinationCity}`
+    : null;
+
+  // ── Initial map centre (seed value — MapBoundsController adjusts it) ───────
   const initialCenter = (() => {
     if (driverLive)                         return [driverLocation.latitude,   driverLocation.longitude];
     if (shipmentLocation?.latitude != null) return [shipmentLocation.latitude, shipmentLocation.longitude];
@@ -331,6 +260,7 @@ export default function ShipmentMap({
   // ── Render ─────────────────────────────────────────────────────────────────
   return (
     <div>
+      {/* ── Map canvas ─────────────────────────────────────────────────────── */}
       <div style={MAP_CONTAINER_STYLE}>
         <MapContainer
           center={initialCenter}
@@ -339,29 +269,40 @@ export default function ShipmentMap({
           zoomControl
           attributionControl
         >
-          {/* OpenStreetMap tiles */}
+          {/* OpenStreetMap tiles — free, no API key, no billing */}
           <TileLayer
             attribution='&copy; <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noreferrer">OpenStreetMap</a> contributors'
             url="https://{s}.tile.openstreetmap.org/{z}/{x}/{y}.png"
             maxZoom={19}
           />
 
-          {/* Auto-fit viewport */}
-          {boundsPoints.length > 0 && <MapBoundsController points={boundsPoints} />}
+          {/* Auto-fit viewport — once per shipment, never on GPS ticks */}
+          {boundsPoints.length > 0 && (
+            <MapBoundsController points={boundsPoints} fitKey={fitKey} />
+          )}
 
-          {/* ── No-driver fallback: full route (road or straight line) ── */}
+          {/* ── Full route: Origin → Destination (no driver GPS) ── */}
           {fullPath && (
-            <Polyline positions={fullPath} pathOptions={FULL_PATH_OPTIONS} />
+            <Polyline
+              positions={fullPath}
+              pathOptions={FULL_PATH_OPTIONS}
+            />
           )}
 
-          {/* ── Completed segment: origin → driver (gray dashed road) ── */}
+          {/* ── Completed segment: Origin → Driver (gray dashed) ── */}
           {completedPath && (
-            <Polyline positions={completedPath} pathOptions={COMPLETED_PATH_OPTIONS} />
+            <Polyline
+              positions={completedPath}
+              pathOptions={COMPLETED_PATH_OPTIONS}
+            />
           )}
 
-          {/* ── Remaining segment: driver → destination (bold blue road) ── */}
+          {/* ── Remaining segment: Driver → Destination (bold blue) ── */}
           {remainingPath && (
-            <Polyline positions={remainingPath} pathOptions={REMAINING_PATH_OPTIONS} />
+            <Polyline
+              positions={remainingPath}
+              pathOptions={REMAINING_PATH_OPTIONS}
+            />
           )}
 
           {/* ── Origin marker 🟢 ── */}
@@ -391,7 +332,7 @@ export default function ShipmentMap({
             />
           )}
 
-          {/* ── Driver marker 🚚 (pulsing ring) ── */}
+          {/* ── Driver marker 🚚 (pulsing ring, always on top) ── */}
           {driverLive && (
             <Marker
               position={[driverLocation.latitude, driverLocation.longitude]}
@@ -407,16 +348,18 @@ export default function ShipmentMap({
         </MapContainer>
       </div>
 
-      {/* ── Map legend ─────────────────────────────────────────────────────── */}
+      {/* ── Legend ─────────────────────────────────────────────────────────── */}
       <div style={legendStyle}>
         <LegendItem emoji="🟢" label={`Origin: ${originCity || "—"}`}           color="#22c55e" />
         <LegendItem emoji="🔴" label={`Destination: ${destinationCity || "—"}`} color="#ef4444" />
+
         {driverLive && (
           <>
-            <LegendSegment color="#94a3b8" dashed label="Completed route" />
+            <LegendSegment color="#64748b" dashed label="Completed route" />
             <LegendSegment color="#2563eb"       label="Remaining route" />
           </>
         )}
+
         {shipmentLocation?.latitude != null && (
           <LegendItem
             emoji="📦"
@@ -427,16 +370,17 @@ export default function ShipmentMap({
             color="#3b82f6"
           />
         )}
+
         {driverLive && (
           <LegendItem
             emoji="🚚"
-            label={`Driver: ${driverLocation.latitude?.toFixed(3)}, ${driverLocation.longitude?.toFixed(3)}`}
+            label={`Driver: ${Number(driverLocation.latitude).toFixed(3)}, ${Number(driverLocation.longitude).toFixed(3)}`}
             color="#f97316"
           />
         )}
       </div>
 
-      {/* ── ETA / distance panel (unchanged Haversine logic) ───────────────── */}
+      {/* ── ETA / distance panel (Haversine — unchanged) ───────────────────── */}
       {routeInfo && (
         <div style={routeInfoStyle}>
           <RouteInfoItem icon="📏" label="Total Distance" value={routeInfo.distance} />
@@ -452,7 +396,7 @@ export default function ShipmentMap({
         </div>
       )}
 
-      {/* ── City lookup error notice (unchanged) ──────────────────────────── */}
+      {/* ── City lookup error notice ──────────────────────────────────────── */}
       {cityError && (
         <p style={{ fontSize: 12, color: "#f97316", marginTop: 8 }}>⚠ {cityError}</p>
       )}
@@ -470,15 +414,16 @@ function LegendItem({ emoji, label, color }) {
   );
 }
 
+// SVG line swatch for route segments in the legend.
 function LegendSegment({ color, dashed, label }) {
   return (
     <span style={{ display: "flex", alignItems: "center", gap: 6, fontSize: 12, color: "#475569" }}>
-      <svg width="24" height="6" style={{ flexShrink: 0 }}>
+      <svg width="28" height="6" style={{ flexShrink: 0 }}>
         <line
-          x1="0" y1="3" x2="24" y2="3"
+          x1="0" y1="3" x2="28" y2="3"
           stroke={color}
-          strokeWidth="2.5"
-          strokeDasharray={dashed ? "5 4" : "none"}
+          strokeWidth="3"
+          strokeDasharray={dashed ? "6 4" : "none"}
         />
       </svg>
       <span>{label}</span>
@@ -506,7 +451,7 @@ function RouteInfoItem({ icon, label, value, accent }) {
   );
 }
 
-// ── Style constants (unchanged) ────────────────────────────────────────────
+// ── Style constants ────────────────────────────────────────────────────────
 const legendStyle = {
   display:      "flex",
   flexWrap:     "wrap",

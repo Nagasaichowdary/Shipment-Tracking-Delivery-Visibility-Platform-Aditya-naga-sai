@@ -1,3 +1,4 @@
+import { createPortal } from "react-dom";
 import { useCallback, useEffect, useRef, useState } from "react";
 import { useNavigate } from "react-router-dom";
 import {
@@ -23,13 +24,29 @@ const formatTimestamp = (value) => {
 
 function NotificationBell({ isAuthenticated }) {
   const navigate = useNavigate();
-  const menuRef = useRef(null);
-  const [isOpen, setIsOpen] = useState(false);
+
+  // menuRef  — wraps the bell button, used for click-outside detection.
+  // bellRef  — the button itself, used for getBoundingClientRect().
+  // popoverRef — the portal <section>, used for click-outside detection.
+  //
+  // The popover is rendered via React Portal directly into document.body.
+  // This removes it from the .topbar stacking context (z-index:5 / backdrop-filter)
+  // so it competes in the root stacking context at z-index:9999 — above every
+  // Leaflet pane (max z-index: 700) on the page.
+  const menuRef    = useRef(null);
+  const bellRef    = useRef(null);
+  const popoverRef = useRef(null);
+
+  const [isOpen,       setIsOpen]       = useState(false);
   const [notifications, setNotifications] = useState([]);
-  const [unreadCount, setUnreadCount] = useState(0);
-  const [isLoading, setIsLoading] = useState(false);
+  const [unreadCount,  setUnreadCount]  = useState(0);
+  const [isLoading,    setIsLoading]    = useState(false);
   const [isMarkingAll, setIsMarkingAll] = useState(false);
-  const [error, setError] = useState("");
+  const [error,        setError]        = useState("");
+
+  // Viewport-relative position of the popup, recalculated on every open.
+  // Using position:fixed so no scroll offset is needed.
+  const [popoverPos, setPopoverPos] = useState({ top: 0, right: 0 });
 
   const refreshUnreadCount = useCallback(async () => {
     if (!isAuthenticated) return;
@@ -74,8 +91,11 @@ function NotificationBell({ isAuthenticated }) {
   useEffect(() => {
     if (!isOpen) return undefined;
 
+    // Click-outside: close when clicking neither the bell wrapper nor the portal popup.
     const handlePointerDown = (event) => {
-      if (!menuRef.current?.contains(event.target)) setIsOpen(false);
+      const inMenu    = menuRef.current?.contains(event.target);
+      const inPopover = popoverRef.current?.contains(event.target);
+      if (!inMenu && !inPopover) setIsOpen(false);
     };
 
     const handleKeyDown = (event) => {
@@ -83,17 +103,30 @@ function NotificationBell({ isAuthenticated }) {
     };
 
     document.addEventListener("pointerdown", handlePointerDown);
-    document.addEventListener("keydown", handleKeyDown);
+    document.addEventListener("keydown",     handleKeyDown);
     return () => {
       document.removeEventListener("pointerdown", handlePointerDown);
-      document.removeEventListener("keydown", handleKeyDown);
+      document.removeEventListener("keydown",     handleKeyDown);
     };
   }, [isOpen]);
 
   const handleToggle = async () => {
     const nextOpen = !isOpen;
     setIsOpen(nextOpen);
-    if (nextOpen) await loadNotifications();
+
+    if (nextOpen) {
+      // Compute viewport-relative anchor so the portal knows where to paint.
+      // getBoundingClientRect() returns coordinates relative to the viewport,
+      // which is exactly what position:fixed uses — no scroll offset needed.
+      const rect = bellRef.current?.getBoundingClientRect();
+      if (rect) {
+        setPopoverPos({
+          top:   rect.bottom + 10,
+          right: window.innerWidth - rect.right,
+        });
+      }
+      await loadNotifications();
+    }
   };
 
   const handleNotificationClick = async (notification) => {
@@ -137,22 +170,23 @@ function NotificationBell({ isAuthenticated }) {
     }
   };
 
-  return (
-    <div className="notification-menu" ref={menuRef}>
-      <button
-        aria-expanded={isOpen}
-        aria-haspopup="dialog"
-        aria-label={`Notifications${unreadCount ? ` (${unreadCount} unread)` : ""}`}
-        className="notification-bell"
-        onClick={handleToggle}
-        type="button"
-      >
-        <span aria-hidden="true">&#128276;</span>
-        {unreadCount > 0 && <span className="notification-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>}
-      </button>
-
-      {isOpen && (
-        <section aria-label="Notifications" className="notification-popover" role="dialog">
+  // The portal <section> is rendered into document.body with position:fixed.
+  // This places it in the root stacking context at z-index:9999 — completely
+  // outside the .topbar backdrop-filter stacking context (z-index:5).
+  const popover = isOpen
+    ? createPortal(
+        <section
+          aria-label="Notifications"
+          className="notification-popover"
+          ref={popoverRef}
+          role="dialog"
+          style={{
+            position: "fixed",
+            top:      popoverPos.top,
+            right:    popoverPos.right,
+            zIndex:   9999,
+          }}
+        >
           <div className="notification-popover-header">
             <div>
               <h2>Notifications</h2>
@@ -187,9 +221,32 @@ function NotificationBell({ isAuthenticated }) {
               </button>
             ))}
           </div>
-        </section>
-      )}
-    </div>
+        </section>,
+        document.body,
+      )
+    : null;
+
+  return (
+    <>
+      {/* Bell button wrapper — stays in normal DOM flow inside the topbar */}
+      <div className="notification-menu" ref={menuRef}>
+        <button
+          aria-expanded={isOpen}
+          aria-haspopup="dialog"
+          aria-label={`Notifications${unreadCount ? ` (${unreadCount} unread)` : ""}`}
+          className="notification-bell"
+          onClick={handleToggle}
+          ref={bellRef}
+          type="button"
+        >
+          <span aria-hidden="true">&#128276;</span>
+          {unreadCount > 0 && <span className="notification-badge">{unreadCount > 99 ? "99+" : unreadCount}</span>}
+        </button>
+      </div>
+
+      {/* Portal: renders into document.body, bypassing topbar's stacking context */}
+      {popover}
+    </>
   );
 }
 
