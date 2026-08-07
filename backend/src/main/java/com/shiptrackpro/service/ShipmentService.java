@@ -177,4 +177,37 @@ public interface ShipmentService {
      */
     com.shiptrackpro.dto.DelayPredictionResponse getDelay(Long shipmentId);
 
+    // ── Delivery Confirmation (Milestone 3 + POD) ────────────────────────────
+
+    /**
+     * Confirms delivery of a shipment by the authenticated driver, saving the
+     * customer's signature and delivery photo as Proof of Delivery (POD).
+     *
+     * <p>Business rules enforced:
+     * <ol>
+     *   <li>Shipment must exist.</li>
+     *   <li>Shipment status must be {@code OUT_FOR_DELIVERY}.</li>
+     *   <li>Delivery must not have been confirmed already.</li>
+     *   <li>The caller must be the driver currently assigned to this shipment.</li>
+     *   <li>Receiver name must not be blank after trimming.</li>
+     *   <li>Signature file must be present and a valid PNG.</li>
+     *   <li>Delivery photo must be present, JPG/PNG, and ≤ 5 MB.</li>
+     * </ol>
+     * On success: files are saved first, then status → {@code DELIVERED} and
+     * all POD fields are persisted atomically.</p>
+     *
+     * @param shipmentId      the shipment to confirm
+     * @param driverEmail     email of the authenticated driver (from JWT)
+     * @param request         text fields from the multipart form
+     * @param signatureFile   PNG drawn on the signature canvas
+     * @param deliveryPhotoFile JPG/PNG delivery photo
+     * @return structured confirmation response including file paths
+     */
+    com.shiptrackpro.dto.DeliveryConfirmationResponse confirmDelivery(
+            Long shipmentId,
+            String driverEmail,
+            com.shiptrackpro.dto.DeliveryConfirmationRequest request,
+            org.springframework.web.multipart.MultipartFile signatureFile,
+            org.springframework.web.multipart.MultipartFile deliveryPhotoFile);
+
 }

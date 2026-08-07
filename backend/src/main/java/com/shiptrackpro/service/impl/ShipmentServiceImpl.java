@@ -15,12 +15,16 @@ import com.shiptrackpro.enums.ShipmentStatus;
 import com.shiptrackpro.exception.ResourceNotFoundException;
 import com.shiptrackpro.repository.ShipmentRepository;
 import com.shiptrackpro.repository.UserRepository;
+import com.shiptrackpro.service.AuthService;
 import com.shiptrackpro.service.EtaCalculationService;
+import com.shiptrackpro.service.FileStorageService;
+import com.shiptrackpro.service.RouteHistoryService;
 import com.shiptrackpro.service.ShipmentService;
 import com.shiptrackpro.service.NotificationService;
 import com.shiptrackpro.enums.NotificationEventType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
+import org.springframework.web.multipart.MultipartFile;
 
 import java.time.Duration;
 import java.time.LocalDateTime;
@@ -46,6 +50,9 @@ public class ShipmentServiceImpl implements ShipmentService {
     private final UserRepository userRepository;
     private final EtaCalculationService etaCalculationService;
     private final NotificationService notificationService;
+    private final FileStorageService fileStorageService;
+    private final AuthService authService;
+    private final RouteHistoryService routeHistoryService;
 
     /**
      * Constructor injection — preferred over field injection for
@@ -54,16 +61,40 @@ public class ShipmentServiceImpl implements ShipmentService {
     public ShipmentServiceImpl(ShipmentRepository shipmentRepository,
                                UserRepository userRepository,
                                EtaCalculationService etaCalculationService,
-                               NotificationService notificationService) {
-        this.shipmentRepository = shipmentRepository;
-        this.userRepository = userRepository;
+                               NotificationService notificationService,
+                               FileStorageService fileStorageService,
+                               AuthService authService,
+                               RouteHistoryService routeHistoryService) {
+        this.shipmentRepository   = shipmentRepository;
+        this.userRepository       = userRepository;
         this.etaCalculationService = etaCalculationService;
-        this.notificationService = notificationService;
+        this.notificationService  = notificationService;
+        this.fileStorageService   = fileStorageService;
+        this.authService          = authService;
+        this.routeHistoryService  = routeHistoryService;
     }
 
     @Override
     public ShipmentResponse createShipment(CreateShipmentRequest request, Long createdByUserId) {
         User createdBy = findUserOrThrow(createdByUserId, "creator");
+
+        // Determine guest email:
+        //   - Registered customer path (receiverUserId set): guestEmail must be null —
+        //     the registered customer's email is always fetched from their User entity
+        //     by the Delivery OTP system at delivery time.
+        //   - Guest customer path (receiverUserId null): guestEmail is required so the
+        //     Delivery OTP system has an email address to send the verification code to.
+        boolean hasRegisteredReceiver = request.getReceiverUserId() != null;
+        String resolvedGuestEmail = null;
+        if (!hasRegisteredReceiver) {
+            String rawGuest = request.getGuestEmail();
+            if (rawGuest == null || rawGuest.isBlank()) {
+                throw new IllegalArgumentException(
+                        "Receiver email is required for guest customers. " +
+                        "Please provide a valid email address or select a registered customer.");
+            }
+            resolvedGuestEmail = rawGuest.trim().toLowerCase();
+        }
 
         Shipment shipment = Shipment.builder()
                 .trackingNumber(generateUniqueTrackingNumber())
@@ -73,6 +104,7 @@ public class ShipmentServiceImpl implements ShipmentService {
                 .receiverName(request.getReceiverName())
                 .receiverPhone(request.getReceiverPhone())
                 .receiverUser(resolveOptionalUser(request.getReceiverUserId()))
+                .guestEmail(resolvedGuestEmail)
                 .originAddress(toAddressEntity(request.getOriginAddress()))
                 .destinationAddress(toAddressEntity(request.getDestinationAddress()))
                 .packageWeight(request.getPackageWeight())
@@ -88,11 +120,18 @@ public class ShipmentServiceImpl implements ShipmentService {
         // cascade = {PERSIST, MERGE} on Shipment's associations (see the
         // modified entity) persists them in the same operation.
         Shipment saved = shipmentRepository.save(shipment);
-        
+
+        // ── Route History: record initial lifecycle event ──────────────────
+        String originCity = (saved.getOriginAddress() != null) ? saved.getOriginAddress().getCity() : null;
+        routeHistoryService.record(saved, saved.getShipmentStatus(), originCity,
+                "Shipment created by " + createdBy.getFirstName() + " " + createdBy.getLastName()
+                + ". Origin: " + (originCity != null ? originCity : "N/A")
+                + ". Destination: " + (saved.getDestinationAddress() != null ? saved.getDestinationAddress().getCity() : "N/A"));
+
         // Notify relevant stakeholders (sender, receiver, creator)
-        notifyStakeholders(saved, NotificationEventType.SHIPMENT_CREATED, 
+        notifyStakeholders(saved, NotificationEventType.SHIPMENT_CREATED,
                 "Shipment Created", "Shipment " + saved.getTrackingNumber() + " has been created.");
-        
+
         return mapToResponse(saved);
     }
 
@@ -152,10 +191,13 @@ public class ShipmentServiceImpl implements ShipmentService {
         shipment.setShipmentStatus(ShipmentStatus.CANCELLED);
 
         Shipment cancelled = shipmentRepository.save(shipment);
-        
-        notifyStakeholders(cancelled, NotificationEventType.CANCELLED, 
+
+        // ── Route History: soft-cancel event ──────────────────────────────
+        routeHistoryService.record(cancelled, ShipmentStatus.CANCELLED, null, "Shipment cancelled.");
+
+        notifyStakeholders(cancelled, NotificationEventType.CANCELLED,
                 "Shipment Cancelled", "Shipment " + cancelled.getTrackingNumber() + " was cancelled.");
-        
+
         return mapToResponse(cancelled);
     }
 
@@ -178,7 +220,13 @@ public class ShipmentServiceImpl implements ShipmentService {
         }
         
         Shipment updated = shipmentRepository.save(shipment);
-        
+
+        // ── Route History: status-change event ────────────────────────────
+        String rhDesc = buildRouteHistoryDescription(newStatus, updated);
+        String rhLoc  = (ShipmentStatus.DELIVERED.equals(newStatus) && updated.getDestinationAddress() != null)
+                ? updated.getDestinationAddress().getCity() : null;
+        routeHistoryService.record(updated, newStatus, rhLoc, rhDesc);
+
         NotificationEventType eventType = mapStatusToEvent(newStatus);
         if (eventType != null) {
             String title;
@@ -198,8 +246,31 @@ public class ShipmentServiceImpl implements ShipmentService {
             }
             notifyStakeholders(updated, eventType, title, message);
         }
-        
+
         return mapToResponse(updated);
+    }
+
+    /**
+     * Builds a human-readable description for a route history event
+     * based on the new shipment status.
+     */
+    private String buildRouteHistoryDescription(ShipmentStatus status, Shipment shipment) {
+        return switch (status) {
+            case PENDING_DRIVER   -> "Shipment is waiting for a driver to accept.";
+            case DRIVER_ASSIGNED  -> "Driver assigned and heading to pickup location.";
+            case PICKED_UP        -> "Package collected from sender.";
+            case IN_TRANSIT       -> "Package is in transit to the destination hub.";
+            case DELAYED          -> "Shipment delayed. Reason: " +
+                    (shipment.getDelayReason() != null ? shipment.getDelayReason() : "Not specified") + ".";
+            case OUT_FOR_DELIVERY -> "Package is out for final-mile delivery.";
+            case DELIVERED        -> "Package delivered to " +
+                    (shipment.getDeliveryReceiverName() != null ? shipment.getDeliveryReceiverName() : "recipient") + ".";
+            case CANCELLED        -> "Shipment cancelled. Reason: " +
+                    (shipment.getCancellationReason() != null ? shipment.getCancellationReason() : "Not specified") + ".";
+            case FAILED_DELIVERY  -> "Delivery attempt failed. Package will be returned or re-attempted.";
+            case RETURNED         -> "Package returned to sender.";
+            default               -> "Shipment status updated to " + status.name() + ".";
+        };
     }
     
     private void notifyStakeholders(Shipment shipment, NotificationEventType eventType, String title, String message) {
@@ -290,13 +361,17 @@ public class ShipmentServiceImpl implements ShipmentService {
 
         shipment.setAssignedDriver(driver);
         Shipment saved = shipmentRepository.save(shipment);
-        
+
+        // ── Route History: driver assignment event ────────────────────────
+        routeHistoryService.record(saved, ShipmentStatus.DRIVER_ASSIGNED, null,
+                "Driver " + driver.getFirstName() + " " + driver.getLastName() + " assigned to this shipment.");
+
         // Notify driver
-        notificationService.createNotification(driver, saved, NotificationEventType.DRIVER_ASSIGNED, 
+        notificationService.createNotification(driver, saved, NotificationEventType.DRIVER_ASSIGNED,
                 "New Assignment", "You have been assigned to shipment " + saved.getTrackingNumber());
-                
+
         // Notify stakeholders
-        notifyStakeholders(saved, NotificationEventType.DRIVER_ASSIGNED, 
+        notifyStakeholders(saved, NotificationEventType.DRIVER_ASSIGNED,
                 "Driver Assigned", "A driver has been assigned to shipment " + saved.getTrackingNumber());
 
         return DriverAssignmentResponse.builder()
@@ -665,6 +740,7 @@ public class ShipmentServiceImpl implements ShipmentService {
                 .receiverName(shipment.getReceiverName())
                 .receiverPhone(shipment.getReceiverPhone())
                 .receiverUserId(shipment.getReceiverUser() != null ? shipment.getReceiverUser().getUserId() : null)
+                .guestEmail(shipment.getGuestEmail())
                 .originAddress(mapAddress(shipment.getOriginAddress()))
                 .destinationAddress(mapAddress(shipment.getDestinationAddress()))
                 .packageWeight(shipment.getPackageWeight())
@@ -672,11 +748,18 @@ public class ShipmentServiceImpl implements ShipmentService {
                 .packageType(shipment.getPackageType())
                 .shipmentStatus(shipment.getShipmentStatus())
                 .expectedDeliveryDate(shipment.getExpectedDeliveryDate())
-                .createdByUserId(shipment.getCreatedBy().getUserId())
+                .createdByUserId(shipment.getCreatedBy() != null ? shipment.getCreatedBy().getUserId() : null)
                 .assignedDriverId(driver != null ? driver.getUserId() : null)
                 .assignedDriverName(driver != null ? driver.getFullName() : null)
                 .cancellationReason(shipment.getCancellationReason())
                 .delayReason(shipment.getDelayReason())
+                // Proof of Delivery fields — null for non-DELIVERED shipments
+                .deliveryConfirmed(shipment.getDeliveryConfirmed())
+                .deliveredAt(shipment.getDeliveredAt())
+                .deliveryReceiverName(shipment.getDeliveryReceiverName())
+                .deliveryRemarks(shipment.getDeliveryRemarks())
+                .customerSignaturePath(shipment.getCustomerSignaturePath())
+                .deliveryPhotoPath(shipment.getDeliveryPhotoPath())
                 .createdAt(shipment.getCreatedAt())
                 .updatedAt(shipment.getUpdatedAt())
                 .build();
@@ -706,6 +789,124 @@ public class ShipmentServiceImpl implements ShipmentService {
         } while (shipmentRepository.existsByTrackingNumber(candidate));
 
         return candidate;
+    }
+
+    // ------------------------------------------------------------------
+    // Milestone 3: Delivery Confirmation + Proof of Delivery (POD)
+    // ------------------------------------------------------------------
+
+    @Override
+    public com.shiptrackpro.dto.DeliveryConfirmationResponse confirmDelivery(
+            Long shipmentId,
+            String driverEmail,
+            com.shiptrackpro.dto.DeliveryConfirmationRequest request,
+            MultipartFile signatureFile,
+            MultipartFile deliveryPhotoFile) {
+
+        Shipment shipment = findShipmentOrThrow(shipmentId);
+
+        // ── Security Gate: Backend OTP verification check ─────────────────────
+        // This is the FINAL authority. Even if the frontend allows submission,
+        // the delivery CANNOT be confirmed unless the customer's OTP was
+        // successfully verified via POST /api/driver/delivery-otp/verify.
+        if (!authService.isDeliveryOtpVerified(shipmentId)) {
+            throw new IllegalStateException(
+                    "Delivery OTP verification required. " +
+                    "The customer's identity must be verified via OTP before confirming delivery. " +
+                    "Please generate and verify the delivery OTP first.");
+        }
+
+        // Rule 1: Status must be OUT_FOR_DELIVERY
+        if (shipment.getShipmentStatus() != ShipmentStatus.OUT_FOR_DELIVERY) {
+            throw new IllegalStateException(
+                    "Delivery can only be confirmed when the shipment status is OUT_FOR_DELIVERY. " +
+                    "Current status: " + shipment.getShipmentStatus());
+        }
+
+        // Rule 2: Delivery must not have been confirmed already
+        if (Boolean.TRUE.equals(shipment.getDeliveryConfirmed())) {
+            throw new IllegalStateException(
+                    "Delivery for shipment " + shipment.getTrackingNumber() + " has already been confirmed.");
+        }
+
+        // Rule 3: Only the assigned driver may confirm
+        User assignedDriver = shipment.getAssignedDriver();
+        if (assignedDriver == null || !assignedDriver.getEmail().equalsIgnoreCase(driverEmail)) {
+            throw new IllegalStateException(
+                    "You are not the assigned driver for shipment " + shipment.getTrackingNumber() + ".");
+        }
+
+        // Rule 4: Receiver name must not be blank after trimming
+        String trimmedReceiverName = (request.getReceiverName() == null)
+                ? "" : request.getReceiverName().trim();
+        if (trimmedReceiverName.isEmpty()) {
+            throw new IllegalStateException("Receiver name must not be blank.");
+        }
+        String rawRemarks  = request.getDeliveryRemarks();
+        String trimmedRemarks = (rawRemarks == null) ? null : rawRemarks.trim();
+        if (trimmedRemarks != null && trimmedRemarks.isEmpty()) {
+            trimmedRemarks = null;
+        }
+
+        // ── POD file validation & save ────────────────────────────────────
+        // Files are saved BEFORE the DB update. If saving fails the DB is
+        // never modified, so no partial-confirmation state is possible.
+        String sigPath;
+        String photoPath;
+        try {
+            sigPath   = fileStorageService.saveSignature(signatureFile,  shipment.getTrackingNumber());
+            photoPath = fileStorageService.saveDeliveryPhoto(deliveryPhotoFile, shipment.getTrackingNumber());
+        } catch (java.io.IOException ex) {
+            throw new IllegalStateException("Failed to save POD files: " + ex.getMessage(), ex);
+        }
+
+        // ── Persist confirmation ──────────────────────────────────────────
+        LocalDateTime now = LocalDateTime.now();
+        shipment.setShipmentStatus(ShipmentStatus.DELIVERED);
+        shipment.setDeliveryConfirmed(true);
+        shipment.setDeliveredAt(now);
+        shipment.setDeliveryReceiverName(trimmedReceiverName);
+        shipment.setDeliveryRemarks(trimmedRemarks);
+        shipment.setCustomerSignaturePath(sigPath);
+        shipment.setDeliveryPhotoPath(photoPath);
+
+        Shipment saved = shipmentRepository.save(shipment);
+        // Flush the shipment UPDATE to the DB immediately so that the route_history
+        // INSERT (which has a FK → shipments.id) is guaranteed to see the parent row.
+        // Without this flush, Hibernate may defer the UPDATE until after the
+        // route_history INSERT triggers an implicit flush, causing any schema-level
+        // failure to be silently swallowed by RouteHistoryServiceImpl.record()'s catch.
+        shipmentRepository.flush();
+
+        // ── Route History: delivery confirmation event ─────────────────────
+        String delivCity = (saved.getDestinationAddress() != null) ? saved.getDestinationAddress().getCity() : null;
+        routeHistoryService.record(saved, ShipmentStatus.DELIVERED, delivCity,
+                "Package delivered to " + trimmedReceiverName + ". Confirmed by driver "
+                + assignedDriver.getFirstName() + " " + assignedDriver.getLastName() + ".");
+
+        // Clear the OTP verification record — prevents any re-use of this
+        // verification token for a second confirmDelivery call on the same shipment.
+        authService.clearDeliveryOtpVerification(shipmentId);
+
+        // Notify all stakeholders
+        notifyStakeholders(saved, NotificationEventType.DELIVERED,
+                "Shipment Delivered",
+                "Shipment " + saved.getTrackingNumber() + " has been delivered to "
+                        + trimmedReceiverName + ".");
+
+        return com.shiptrackpro.dto.DeliveryConfirmationResponse.builder()
+                .shipmentId(saved.getId())
+                .trackingNumber(saved.getTrackingNumber())
+                .shipmentStatus(saved.getShipmentStatus().name())
+                .deliveryReceiverName(saved.getDeliveryReceiverName())
+                .deliveryRemarks(saved.getDeliveryRemarks())
+                .deliveredAt(saved.getDeliveredAt())
+                .deliveryConfirmed(true)
+                .customerSignaturePath(saved.getCustomerSignaturePath())
+                .deliveryPhotoPath(saved.getDeliveryPhotoPath())
+                .confirmedByDriver(assignedDriver.getFullName())
+                .message("Delivery confirmed successfully for shipment " + saved.getTrackingNumber() + ".")
+                .build();
     }
 
 }

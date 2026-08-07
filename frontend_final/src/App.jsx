@@ -19,6 +19,10 @@ import PendingUsers from "./assets/pages/PendingUsers";
 import ApprovedUsers from "./assets/pages/ApprovedUsers";
 import RejectedUsers from "./assets/pages/RejectedUsers";
 import AvailableDeliveries from "./assets/pages/AvailableDeliveries";
+import DeliveryHistory from "./assets/pages/DeliveryHistory";
+import AnalyticsDashboard from "./assets/pages/AnalyticsDashboard";
+import RouteHistory from "./assets/pages/RouteHistory";
+import DeliveryReports from "./assets/pages/DeliveryReports";
 
 function ProtectedRoute({ children }) {
   const { isAuthenticated } = useContext(AuthContext);
@@ -55,6 +59,7 @@ function AppLayout() {
             <Routes>
               <Route path="/dashboard" element={<Dashboard />} />
               <Route path="/shipments" element={<ShipmentList />} />
+              <Route path="/shipments/:trackingNumber/route-history" element={<RouteHistory />} />
               <Route
                 path="/shipments/new"
                 element={
@@ -67,6 +72,26 @@ function AppLayout() {
               />
               <Route path="/track" element={<TrackShipment />} />
               <Route path="/profile" element={<Profile />} />
+              <Route
+                path="/analytics"
+                element={
+                  <RoleProtectedRoute
+                    allowedRoles={["Administrator", "Logistics Operator"]}
+                  >
+                    <AnalyticsDashboard />
+                  </RoleProtectedRoute>
+                }
+              />
+              <Route
+                path="/reports"
+                element={
+                  <RoleProtectedRoute
+                    allowedRoles={["Administrator", "Logistics Operator"]}
+                  >
+                    <DeliveryReports />
+                  </RoleProtectedRoute>
+                }
+              />
               <Route path="/dashboard/pending-users" element={<PendingUsers />} />
               <Route path="/dashboard/approved-users" element={<ApprovedUsers />} />
               <Route path="/dashboard/rejected-users" element={<RejectedUsers />} />
@@ -75,6 +100,14 @@ function AppLayout() {
                 element={
                   <RoleProtectedRoute allowedRoles={["Driver"]}>
                     <AvailableDeliveries />
+                  </RoleProtectedRoute>
+                }
+              />
+              <Route
+                path="/driver/history"
+                element={
+                  <RoleProtectedRoute allowedRoles={["Driver"]}>
+                    <DeliveryHistory />
                   </RoleProtectedRoute>
                 }
               />

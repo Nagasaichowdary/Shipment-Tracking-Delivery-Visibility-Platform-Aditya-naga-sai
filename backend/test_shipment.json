@@ -1,0 +1,18 @@
+﻿{
+  "senderName":    "Test Sender",
+  "senderPhone":   "9876543210",
+  "receiverName":  "Test Receiver",
+  "receiverPhone": "8765432109",
+  "shipmentType":  "STANDARD",
+  "packageType":   "BOX",
+  "packageWeight": 2.5,
+  "guestEmail":    "receiver.test@example.com",
+  "originAddress": {
+    "line1": "12 MG Road", "city": "Mumbai",
+    "state": "Maharashtra", "postalCode": "400001", "country": "India"
+  },
+  "destinationAddress": {
+    "line1": "45 Anna Salai", "city": "Chennai",
+    "state": "Tamil Nadu",   "postalCode": "600002", "country": "India"
+  }
+}

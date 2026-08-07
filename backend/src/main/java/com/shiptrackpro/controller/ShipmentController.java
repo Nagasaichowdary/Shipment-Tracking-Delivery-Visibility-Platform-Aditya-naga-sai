@@ -3,6 +3,8 @@ package com.shiptrackpro.controller;
 import com.shiptrackpro.dto.AssignDriverRequest;
 import com.shiptrackpro.dto.CreateShipmentRequest;
 import com.shiptrackpro.dto.DelayPredictionResponse;
+import com.shiptrackpro.dto.DeliveryConfirmationRequest;
+import com.shiptrackpro.dto.DeliveryConfirmationResponse;
 import com.shiptrackpro.dto.DriverAssignmentResponse;
 import com.shiptrackpro.dto.DriverLocationResponse;
 import com.shiptrackpro.dto.DriverResponse;
@@ -18,6 +20,7 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.access.prepost.PreAuthorize;
 import org.springframework.security.core.annotation.AuthenticationPrincipal;
+import org.springframework.security.core.userdetails.UserDetails;
 import org.springframework.web.bind.annotation.DeleteMapping;
 import org.springframework.web.bind.annotation.GetMapping;
 import org.springframework.web.bind.annotation.PatchMapping;
@@ -26,8 +29,16 @@ import org.springframework.web.bind.annotation.PostMapping;
 import org.springframework.web.bind.annotation.PutMapping;
 import org.springframework.web.bind.annotation.RequestBody;
 import org.springframework.web.bind.annotation.RequestMapping;
+import org.springframework.web.bind.annotation.RequestParam;
+import org.springframework.web.bind.annotation.RequestPart;
 import org.springframework.web.bind.annotation.RestController;
+import org.springframework.web.multipart.MultipartFile;
+import org.springframework.http.MediaType;
 
+
+import java.nio.file.Files;
+import java.nio.file.Path;
+import java.nio.file.Paths;
 import java.util.List;
 import java.util.Map;
 
@@ -51,9 +62,12 @@ import java.util.Map;
 public class ShipmentController {
 
     private final ShipmentService shipmentService;
+    private final com.shiptrackpro.service.PodPdfService podPdfService;
 
-    public ShipmentController(ShipmentService shipmentService) {
+    public ShipmentController(ShipmentService shipmentService,
+                              com.shiptrackpro.service.PodPdfService podPdfService) {
         this.shipmentService = shipmentService;
+        this.podPdfService   = podPdfService;
     }
 
     // @PreAuthorize("hasAnyRole('ADMIN', 'CUSTOMER')")
@@ -254,6 +268,148 @@ public class ShipmentController {
         org.springframework.security.core.Authentication auth = org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
         boolean hasRole = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_DRIVER"));
         return org.springframework.http.ResponseEntity.ok("ROLE_DRIVER present: " + hasRole);
+    }
+
+    // ── Milestone 3: Delivery Confirmation + Proof of Delivery ───────────────
+
+    /**
+     * Confirms delivery and stores Proof of Delivery (signature + photo).
+     *
+     * <p>Accepted as {@code multipart/form-data}:
+     * <ul>
+     *   <li>{@code receiverName} — required text field</li>
+     *   <li>{@code deliveryRemarks} — optional text field</li>
+     *   <li>{@code signature} — PNG from the canvas (required)</li>
+     *   <li>{@code photo} — JPG/PNG delivery photo, max 5 MB (required)</li>
+     * </ul>
+     * The driver's identity is resolved from the JWT — never from the request.</p>
+     *
+     * <pre>POST /api/shipments/{id}/confirm-delivery</pre>
+     */
+    @PreAuthorize("hasRole('DRIVER')")
+    @PostMapping(value = "/{id}/confirm-delivery",
+                 consumes = MediaType.MULTIPART_FORM_DATA_VALUE)
+    public ResponseEntity<DeliveryConfirmationResponse> confirmDelivery(
+            @PathVariable Long id,
+            @RequestParam("receiverName") String receiverName,
+            @RequestParam(value = "deliveryRemarks", required = false) String deliveryRemarks,
+            @RequestPart("signature") MultipartFile signatureFile,
+            @RequestPart("photo")     MultipartFile photoFile,
+            @AuthenticationPrincipal UserDetails userDetails) {
+
+        // Assemble DTO from individual @RequestParam values so the service-layer
+        // Bean Validation guards can still run without @RequestBody.
+        DeliveryConfirmationRequest request = new DeliveryConfirmationRequest();
+        request.setReceiverName(receiverName);
+        request.setDeliveryRemarks(deliveryRemarks);
+
+        DeliveryConfirmationResponse response =
+                shipmentService.confirmDelivery(id, userDetails.getUsername(),
+                        request, signatureFile, photoFile);
+        return ResponseEntity.ok(response);
+    }
+
+    // ── Proof of Delivery — file serving ─────────────────────────────────────
+
+    /**
+     * Streams a Proof of Delivery file (signature PNG or delivery photo) back
+     * to the authenticated caller.
+     *
+     * <p>The file path is reconstructed from the tracking number and the
+     * original filename that was stored in the DB. The endpoint deliberately
+     * does NOT accept arbitrary filesystem paths — only the fixed directory
+     * structure {@code uploads/delivery/{trackingNumber}/{filename}} is
+     * reachable, which prevents path-traversal attacks.</p>
+     *
+     * <pre>GET /api/shipments/{id}/pod/{filename}</pre>
+     */
+    @GetMapping("/{id}/pod/{filename:.+}")
+    public ResponseEntity<org.springframework.core.io.Resource> servePodFile(
+            @PathVariable Long id,
+            @PathVariable String filename,
+            @org.springframework.beans.factory.annotation.Value("${app.upload.dir:uploads}") String uploadDir) {
+
+        // Resolve the shipment so we know its trackingNumber (needed for path)
+        ShipmentResponse shipment = shipmentService.getShipmentById(id);
+        String trackingNumber = shipment.getTrackingNumber()
+                .replaceAll("[^A-Za-z0-9\\-]", "_"); // sanitise — matches FileStorageService
+
+        // Sanitise filename — allow only alphanumeric, dash, dot, underscore
+        String safeFilename = filename.replaceAll("[^A-Za-z0-9.\\-_]", "");
+
+        Path filePath = Paths.get(uploadDir, "delivery", trackingNumber, safeFilename)
+                .toAbsolutePath().normalize();
+
+        // Guard: resolved path must still sit inside the upload directory
+        Path uploadRoot = Paths.get(uploadDir).toAbsolutePath().normalize();
+        if (!filePath.startsWith(uploadRoot)) {
+            return ResponseEntity.badRequest().build();
+        }
+
+        if (!Files.exists(filePath)) {
+            return ResponseEntity.notFound().build();
+        }
+
+        try {
+            org.springframework.core.io.Resource resource =
+                    new org.springframework.core.io.UrlResource(filePath.toUri());
+            String contentType = Files.probeContentType(filePath);
+            if (contentType == null) contentType = MediaType.APPLICATION_OCTET_STREAM_VALUE;
+
+            return ResponseEntity.ok()
+                    .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,
+                            "inline; filename=\"" + safeFilename + "\"")
+                    .contentType(MediaType.parseMediaType(contentType))
+                    .body(resource);
+        } catch (java.io.IOException e) {
+            return ResponseEntity.internalServerError().build();
+        }
+    }
+
+    // ── Proof of Delivery — PDF download ──────────────────────────────────────
+
+    /**
+     * Generates and streams a Proof of Delivery PDF for the given shipment.
+     *
+     * <p>Access control is enforced inside {@link PodPdfService#generatePodPdf}:
+     * ADMIN and LOGISTICS_OPERATOR are always allowed; DRIVER is allowed only
+     * for their own deliveries; BUSINESS_CLIENT and CUSTOMER only for their
+     * own shipments (creator / sender / receiver). All checks use the JWT
+     * principal — never a client-supplied parameter.</p>
+     *
+     * <pre>GET /api/shipments/{id}/proof-of-delivery/pdf</pre>
+     */
+    @GetMapping(value = "/{id}/proof-of-delivery/pdf", produces = MediaType.APPLICATION_PDF_VALUE)
+    public ResponseEntity<byte[]> downloadPodPdf(
+            @PathVariable Long id,
+            @AuthenticationPrincipal UserDetails userDetails) {
+
+        // Derive the role string from the granted authorities (e.g. "ROLE_DRIVER")
+        String callerRole = userDetails.getAuthorities().stream()
+                .map(a -> a.getAuthority())
+                .findFirst()
+                .orElse("");
+
+        try {
+            byte[] pdfBytes = podPdfService.generatePodPdf(id,
+                    userDetails.getUsername(), callerRole);
+
+            String filename = "POD-" + id + ".pdf";
+            return ResponseEntity.ok()
+                    .header(org.springframework.http.HttpHeaders.CONTENT_DISPOSITION,
+                            "attachment; filename=\"" + filename + "\"")
+                    .contentType(MediaType.APPLICATION_PDF)
+                    .contentLength(pdfBytes.length)
+                    .body(pdfBytes);
+
+        } catch (org.springframework.security.access.AccessDeniedException e) {
+            return ResponseEntity.status(403).build();
+        } catch (IllegalStateException e) {
+            // Shipment not yet DELIVERED
+            return ResponseEntity.badRequest().build();
+        } catch (java.io.IOException e) {
+            return ResponseEntity.internalServerError().build();
+        }
     }
 
 }

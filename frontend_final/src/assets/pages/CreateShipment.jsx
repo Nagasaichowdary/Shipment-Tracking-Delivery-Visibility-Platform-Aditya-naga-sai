@@ -1,7 +1,8 @@
-import { useContext, useMemo, useState } from "react";
+import { useContext, useEffect, useMemo, useState } from "react";
 import { Link } from "react-router-dom";
 import { AuthContext } from "../context/auth";
 import { ShipmentContext } from "../context/shipments";
+import { getRegisteredCustomers } from "../services/api";
 
 const initialForm = {
   senderName: "",
@@ -11,6 +12,10 @@ const initialForm = {
   senderCountry: "India",
   receiverName: "",
   receiverPhone: "",
+  // Single email field used for both scenarios:
+  //   • Registered customer selected → auto-filled (read-only), maps to receiverUser.email on backend
+  //   • No customer selected        → operator enters (required), sent as guestEmail to backend
+  receiverEmail: "",
   receiverCity: "",
   receiverPostalCode: "",
   receiverCountry: "India",
@@ -19,6 +24,10 @@ const initialForm = {
   weight: "",
   eta: "",
   priority: "Standard",
+  // Delivery OTP link: set when a registered customer is selected from the
+  // dropdown. Sent to the backend as receiverUserId so ShipmentServiceImpl
+  // can call resolveOptionalUser() and persist Shipment.receiverUser.
+  receiverUserId: null,
 };
 
 const allowedCreateRoles = ["Business Client", "Logistics Operator", "Administrator"];
@@ -31,10 +40,61 @@ function CreateShipment() {
   const [submitting, setSubmitting] = useState(false);
   const [apiError, setApiError] = useState("");
 
+  // ── Registered Customer dropdown state ────────────────────────────────
+  // customers: list of approved CUSTOMER accounts fetched from GET /api/customers
+  const [customers, setCustomers] = useState([]);
+  const [customersLoading, setCustomersLoading] = useState(false);
+
+  // Fetch the customer list once on mount so the dropdown is ready immediately.
+  useEffect(() => {
+    setCustomersLoading(true);
+    getRegisteredCustomers()
+      .then((res) => setCustomers(Array.isArray(res.data) ? res.data : []))
+      .catch(() => setCustomers([]))
+      .finally(() => setCustomersLoading(false));
+  }, []);
+
   const canCreate = useMemo(() => allowedCreateRoles.includes(auth.user.role), [auth.user.role]);
 
+  // Generic handler for text / select / textarea inputs
   const handleChange = (event) => {
     setForm((current) => ({ ...current, [event.target.name]: event.target.value }));
+  };
+
+  /**
+   * Handles selection of a registered customer from the dropdown.
+   * When a customer is selected:
+   *   - receiverUserId is stored (sent to backend as the FK link)
+   *   - receiverName is auto-filled with the customer's full name
+   *   - receiverPhone is auto-filled with the customer's phone
+   * When reset back to "Select customer...", all three fields are cleared.
+   */
+  const handleCustomerSelect = (event) => {
+    const selectedId = event.target.value;
+    if (!selectedId) {
+      // Operator cleared the selection — reset ALL customer-linked fields
+      // so no stale customer information remains in the form.
+      setForm((current) => ({
+        ...current,
+        receiverUserId: null,
+        receiverName: "",
+        receiverPhone: "",
+        receiverEmail: "",
+      }));
+      return;
+    }
+    const customer = customers.find((c) => String(c.id) === selectedId);
+    if (!customer) return;
+    setForm((current) => ({
+      ...current,
+      receiverUserId: customer.id,
+      // Auto-fill for convenience; Name and Phone remain editable.
+      receiverName:  customer.fullName || `${customer.firstName} ${customer.lastName}`.trim(),
+      receiverPhone: customer.phone || current.receiverPhone,
+      // Email is auto-filled from the registered account and made READ-ONLY
+      // so operators cannot accidentally change it to an incorrect address.
+      receiverEmail: customer.email || "",
+    }));
   };
 
   const handleSubmit = async (event) => {
@@ -43,6 +103,7 @@ function CreateShipment() {
     setSubmitting(true);
     setApiError("");
     try {
+      console.log("FORM BEFORE CREATE:", form);
       const shipment = await createShipment(form);
       setCreated(shipment);
       setForm(initialForm);
@@ -143,9 +204,52 @@ function CreateShipment() {
           </div>
         </div>
 
-        {/* ── Receiver ─────────────────────────────────── */}
+        {/* ── Receiver ─────────────────────────────── */}
         <h2 className="section-title" style={{ margin: "22px 0 14px" }}>Receiver details</h2>
         <div className="form-grid">
+
+          {/* Registered Customer dropdown — optional but recommended.
+              Selecting a customer sets receiverUserId (FK link), auto-fills
+              receiverName and receiverPhone, and enables the Delivery OTP system
+              to send the verification code to the customer's registered email. */}
+          <div className="form-field full">
+            <label htmlFor="receiverCustomer">
+              Registered Customer
+              <span style={{ color: "var(--muted)", fontWeight: 400, marginLeft: 6 }}>
+                (optional — enables Delivery OTP)
+              </span>
+            </label>
+            <select
+              className="select"
+              id="receiverCustomer"
+              name="receiverCustomer"
+              disabled={!canCreate || customersLoading}
+              value={form.receiverUserId ?? ""}
+              onChange={handleCustomerSelect}
+            >
+              <option value="">
+                {customersLoading ? "Loading customers…" : "— Select registered customer (optional) —"}
+              </option>
+              {customers.map((c) => (
+                <option key={c.id} value={c.id}>
+                  {c.fullName || `${c.firstName} ${c.lastName}`.trim()}
+                  {c.email ? ` — ${c.email}` : ""}
+                </option>
+              ))}
+            </select>
+            {form.receiverUserId && (
+              <p style={{ fontSize: 12, color: "var(--brand)", marginTop: 4 }}>
+                ✔ Customer linked — Delivery OTP will be sent to this customer's registered email.
+              </p>
+            )}
+            {!form.receiverUserId && customers.length > 0 && (
+              <p style={{ fontSize: 12, color: "var(--muted)", marginTop: 4 }}>
+                Select a customer to enable Delivery OTP verification. Leave blank to create without customer link.
+              </p>
+            )}
+          </div>
+
+          {/* Receiver name — auto-filled when a customer is selected, editable manually */}
           <div className="form-field">
             <label htmlFor="receiverName">Receiver name</label>
             <input
@@ -160,6 +264,7 @@ function CreateShipment() {
             />
           </div>
 
+          {/* Receiver phone */}
           <div className="form-field">
             <label htmlFor="receiverPhone">Receiver phone</label>
             <input
@@ -171,6 +276,36 @@ function CreateShipment() {
               required
               placeholder="+91 98765 43210"
               value={form.receiverPhone}
+            />
+          </div>
+
+          {/* Receiver email
+              • Registered customer selected: auto-filled from account, READ-ONLY.
+              • Guest customer (no selection): operator enters email, REQUIRED.
+              This single field maps to guestEmail in the backend payload when
+              receiverUserId is null; ignored (null sent) when receiverUserId is set. */}
+          <div className="form-field">
+            <label htmlFor="receiverEmail">
+              Receiver email
+              {form.receiverUserId
+                ? <span style={{ color: "var(--muted)", fontWeight: 400, marginLeft: 6 }}>(registered account — read only)</span>
+                : <span style={{ color: "var(--danger)", marginLeft: 4 }}>*</span>
+              }
+            </label>
+            <input
+              className="input"
+              id="receiverEmail"
+              name="receiverEmail"
+              type="email"
+              placeholder={form.receiverUserId ? "" : "receiver@example.com"}
+              value={form.receiverEmail}
+              onChange={handleChange}
+              // Read-only when a registered customer is selected (email belongs to their account).
+              // Required and editable when no customer is selected (guest email needed for OTP).
+              readOnly={!!form.receiverUserId}
+              required={!form.receiverUserId}
+              disabled={!canCreate}
+              style={form.receiverUserId ? { background: "var(--subtle, #f8fafc)", cursor: "not-allowed" } : {}}
             />
           </div>
 

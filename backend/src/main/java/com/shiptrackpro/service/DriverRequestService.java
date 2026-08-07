@@ -14,6 +14,7 @@ import com.shiptrackpro.repository.DriverRejectionRepository;
 import com.shiptrackpro.repository.ShipmentRepository;
 import com.shiptrackpro.repository.UserRepository;
 import com.shiptrackpro.service.NotificationService;
+import com.shiptrackpro.service.RouteHistoryService;
 import com.shiptrackpro.enums.NotificationEventType;
 import org.springframework.stereotype.Service;
 import org.springframework.transaction.annotation.Transactional;
@@ -47,15 +48,18 @@ public class DriverRequestService {
     private final UserRepository           userRepository;
     private final NotificationService      notificationService;
     private final DriverRejectionRepository driverRejectionRepository;
+    private final RouteHistoryService      routeHistoryService;
 
     public DriverRequestService(ShipmentRepository shipmentRepository,
                                 UserRepository userRepository,
                                 NotificationService notificationService,
-                                DriverRejectionRepository driverRejectionRepository) {
-        this.shipmentRepository       = shipmentRepository;
-        this.userRepository           = userRepository;
-        this.notificationService      = notificationService;
+                                DriverRejectionRepository driverRejectionRepository,
+                                RouteHistoryService routeHistoryService) {
+        this.shipmentRepository        = shipmentRepository;
+        this.userRepository            = userRepository;
+        this.notificationService       = notificationService;
         this.driverRejectionRepository = driverRejectionRepository;
+        this.routeHistoryService       = routeHistoryService;
     }
 
     // ── Available Shipments ────────────────────────────────────────────────
@@ -123,27 +127,32 @@ public class DriverRequestService {
         shipment.setAssignedDriver(driver);
         shipment.setShipmentStatus(ShipmentStatus.DRIVER_ASSIGNED);
         Shipment saved = shipmentRepository.save(shipment);
-        
+
+        // ── Route History: driver self-accept event ───────────────────────────
+        routeHistoryService.record(saved, ShipmentStatus.DRIVER_ASSIGNED, null,
+                "Driver " + driver.getFirstName() + " " + driver.getLastName()
+                + " accepted and self-assigned this shipment from the driver pool.");
+
         // Notify driver
-        notificationService.createNotification(driver, saved, NotificationEventType.DRIVER_ASSIGNED, 
+        notificationService.createNotification(driver, saved, NotificationEventType.DRIVER_ASSIGNED,
                 "Delivery Accepted", "You have successfully accepted shipment " + saved.getTrackingNumber());
-                
+
         // Notify stakeholders
         java.util.Set<Long> notifiedUserIds = new java.util.HashSet<>();
         notifiedUserIds.add(driver.getUserId());
-        
+
         if (saved.getSenderUser() != null) {
-            notificationService.createNotification(saved.getSenderUser(), saved, NotificationEventType.DRIVER_ASSIGNED, 
+            notificationService.createNotification(saved.getSenderUser(), saved, NotificationEventType.DRIVER_ASSIGNED,
                     "Driver Assigned", "Driver " + driver.getFullName() + " is heading to pickup shipment " + saved.getTrackingNumber());
             notifiedUserIds.add(saved.getSenderUser().getUserId());
         }
         if (saved.getReceiverUser() != null && !notifiedUserIds.contains(saved.getReceiverUser().getUserId())) {
-            notificationService.createNotification(saved.getReceiverUser(), saved, NotificationEventType.DRIVER_ASSIGNED, 
+            notificationService.createNotification(saved.getReceiverUser(), saved, NotificationEventType.DRIVER_ASSIGNED,
                     "Driver Assigned", "Driver " + driver.getFullName() + " is heading to pickup shipment " + saved.getTrackingNumber());
             notifiedUserIds.add(saved.getReceiverUser().getUserId());
         }
         if (saved.getCreatedBy() != null && !notifiedUserIds.contains(saved.getCreatedBy().getUserId())) {
-            notificationService.createNotification(saved.getCreatedBy(), saved, NotificationEventType.DRIVER_ASSIGNED, 
+            notificationService.createNotification(saved.getCreatedBy(), saved, NotificationEventType.DRIVER_ASSIGNED,
                     "Driver Assigned", "Driver " + driver.getFullName() + " is heading to pickup shipment " + saved.getTrackingNumber());
             notifiedUserIds.add(saved.getCreatedBy().getUserId());
         }
@@ -201,6 +210,32 @@ public class DriverRequestService {
                 .toList();
     }
 
+    // ── Delivery History ───────────────────────────────────────────────────
+
+    /**
+     * Returns all DELIVERED shipments for the authenticated driver, sorted
+     * newest-delivered-first. Only the caller's own deliveries are returned —
+     * driver isolation is enforced at the repository query level.
+     *
+     * @param driverEmail email of the authenticated driver
+     * @return list of delivered shipments including POD fields (never {@code null})
+     */
+    @Transactional(readOnly = true)
+    public List<ShipmentResponse> getDeliveryHistory(String driverEmail) {
+        User driver = userRepository.findByEmail(driverEmail)
+                .orElseThrow(() -> new ResourceNotFoundException("Driver not found: " + driverEmail));
+
+        return shipmentRepository
+                .findByAssignedDriverAndShipmentStatus(driver, ShipmentStatus.DELIVERED)
+                .stream()
+                .sorted(java.util.Comparator.comparing(
+                        (Shipment s) -> s.getDeliveredAt() != null ? s.getDeliveredAt() : s.getUpdatedAt(),
+                        java.util.Comparator.nullsLast(java.util.Comparator.reverseOrder())
+                ))
+                .map(this::mapToShipmentResponse)
+                .toList();
+    }
+
     // ── Mapping helpers ────────────────────────────────────────────────────
 
     private AvailableShipmentResponse mapToAvailableResponse(Shipment s) {
@@ -233,9 +268,16 @@ public class DriverRequestService {
                 .packageType(s.getPackageType())
                 .shipmentStatus(s.getShipmentStatus())
                 .expectedDeliveryDate(s.getExpectedDeliveryDate())
-                .createdByUserId(s.getCreatedBy().getUserId())
+                .createdByUserId(s.getCreatedBy() != null ? s.getCreatedBy().getUserId() : null)
                 .assignedDriverId(driver != null ? driver.getUserId() : null)
                 .assignedDriverName(driver != null ? driver.getFullName() : null)
+                // Proof of Delivery fields (populated for DELIVERED shipments)
+                .deliveryConfirmed(s.getDeliveryConfirmed())
+                .deliveredAt(s.getDeliveredAt())
+                .deliveryReceiverName(s.getDeliveryReceiverName())
+                .deliveryRemarks(s.getDeliveryRemarks())
+                .customerSignaturePath(s.getCustomerSignaturePath())
+                .deliveryPhotoPath(s.getDeliveryPhotoPath())
                 .createdAt(s.getCreatedAt())
                 .updatedAt(s.getUpdatedAt())
                 .build();

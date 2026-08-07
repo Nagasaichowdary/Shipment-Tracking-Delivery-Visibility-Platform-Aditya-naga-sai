@@ -75,6 +75,22 @@ public class Shipment {
     private User receiverUser;
 
     /**
+     * Email address for a guest (non-registered) receiver.
+     *
+     * <p>Populated during shipment creation when the operator does NOT select
+     * a registered customer from the dropdown ({@code receiverUser} is null).
+     * Used by the Delivery OTP system as a fallback when
+     * {@code shipment.getReceiverUser()} is null — allowing the driver to send
+     * an OTP to a guest receiver without requiring them to have a platform account.
+     *
+     * <p>Always {@code null} when {@code receiverUser} is set (the registered
+     * customer's email is fetched directly from their {@link User} entity).
+     * Always {@code null} for shipments created before this feature was added.
+     */
+    @Column(name = "guest_email", length = 255)
+    private String guestEmail;
+
+    /**
      * The driver (User with ROLE_DRIVER) currently assigned to deliver this
      * shipment. Nullable — null means the shipment is not yet dispatched to a
      * specific driver.
@@ -138,7 +154,63 @@ public class Shipment {
     @Column(name = "delay_reason", length = 500)
     private String delayReason;
 
+    // ──────────────────────────────────────────────────────────────────────
+    // Milestone 3: Delivery Confirmation fields
+    // ──────────────────────────────────────────────────────────────────────
+
+    /**
+     * Whether the delivery has been formally confirmed by the assigned driver.
+     * Defaults to {@code false}; set to {@code true} by
+     * {@code POST /api/shipments/{id}/confirm-delivery}.
+     *
+     * <p>Column is nullable in the DB so {@code ddl-auto=update} can add it to
+     * existing populated tables without a migration script. All reads use
+     * {@code Boolean.TRUE.equals()} which treats {@code null} as {@code false}.</p>
+     */
+    @Column(name = "delivery_confirmed")
+    @Builder.Default
+    private Boolean deliveryConfirmed = false;
+
+    /**
+     * Server-side timestamp recorded at the moment the driver confirms delivery.
+     * {@code null} until the delivery is confirmed.
+     */
+    @Column(name = "delivered_at")
+    private LocalDateTime deliveredAt;
+
+    /**
+     * Name of the person who physically received the package.
+     * Supplied by the driver at confirmation time.
+     * Distinct from {@code receiverName} (the intended recipient from the shipment form).
+     */
+    @Column(name = "delivery_receiver_name", length = 150)
+    private String deliveryReceiverName;
+
+    /**
+     * Optional free-text remarks from the driver about the delivery
+     * (e.g. "Left with neighbour", "Handed to security").
+     */
+    @Column(name = "delivery_remarks", length = 500)
+    private String deliveryRemarks;
+
+    /**
+     * Relative path to the customer's drawn signature PNG on the server filesystem.
+     * Populated by {@code POST /api/shipments/{id}/confirm-delivery}.
+     * Example: {@code delivery/SHIP-ABCD1234/signature.png}
+     */
+    @Column(name = "customer_signature_path", length = 500)
+    private String customerSignaturePath;
+
+    /**
+     * Relative path to the delivery photo on the server filesystem.
+     * Populated by {@code POST /api/shipments/{id}/confirm-delivery}.
+     * Example: {@code delivery/SHIP-ABCD1234/delivery-photo.jpg}
+     */
+    @Column(name = "delivery_photo_path", length = 500)
+    private String deliveryPhotoPath;
+
     // MODIFIED: added cascade = {PERSIST, MERGE}
+
     @ManyToOne(fetch = FetchType.LAZY, optional = false, cascade = {CascadeType.PERSIST, CascadeType.MERGE})
     @JoinColumn(name = "origin_address_id", nullable = false)
     private Address originAddress;

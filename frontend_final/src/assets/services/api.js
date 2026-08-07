@@ -1,6 +1,6 @@
 import axios from "axios";
 
-const API = axios.create({
+export const API = axios.create({
   baseURL: "http://localhost:8080/api",
 });
 
@@ -46,6 +46,18 @@ export const getShipmentById = (id) => API.get(`/shipments/${id}`);
 
 export const createShipment = (data) => API.post("/shipments", data);
 
+/**
+ * Fetches all approved registered customers from the dedicated Customer API.
+ * Used to populate the "Registered Customer" dropdown on the Shipment Creation
+ * page. The selected customer's ID is sent as receiverUserId when creating a
+ * shipment, which links Shipment.receiverUser so the Delivery OTP system can
+ * retrieve shipment.receiverUser.getEmail() at delivery time.
+ *
+ * GET /api/customers
+ */
+export const getRegisteredCustomers = () => API.get("/customers");
+
+
 export const updateShipment = (id, data) => API.put(`/shipments/${id}`, data);
 
 export const updateShipmentStatus = (id, status, cancellationReason, delayReason) =>
@@ -79,8 +91,67 @@ export const rejectShipmentRequest = (shipmentId) => API.post(`/driver/reject/${
 
 export const getMyShipments = () => API.get("/driver/my-shipments");
 
+/** Returns all DELIVERED shipments for the authenticated driver, sorted newest-first. */
+export const getDeliveryHistory = () => API.get("/driver/delivery-history");
+
+/**
+ * Downloads the Proof of Delivery PDF for a shipment.
+ * The JWT is forwarded automatically by the Axios interceptor.
+ *
+ * @param {number} shipmentId - DB id of the delivered shipment
+ * @returns {Promise<Blob>} PDF blob
+ */
+export const downloadPodPdf = (shipmentId) =>
+  API.get(`/shipments/${shipmentId}/proof-of-delivery/pdf`, {
+    responseType: "blob",
+  });
+
 /** Updates the authenticated driver's GPS location via PUT /api/drivers/location */
 export const updateDriverLocation = (data) => API.put("/drivers/location", data);
+
+// Milestone 3: Delivery Confirmation + Proof of Delivery (POD)
+// Accepts a FormData object containing: receiverName, deliveryRemarks (optional),
+// signature (Blob/File, PNG), photo (File, JPG|PNG ≤ 5 MB).
+export const confirmDelivery = (shipmentId, formData) =>
+  API.post(`/shipments/${shipmentId}/confirm-delivery`, formData, {
+    headers: { "Content-Type": "multipart/form-data" },
+  });
+
+// Milestone 4: Delivery OTP — Customer Identity Verification
+// Generates a 6-digit OTP and emails it to the registered customer's email.
+// The driver never supplies the email — backend fetches it from the shipment.
+export const generateDeliveryOtp = (shipmentId) =>
+  API.post("/driver/delivery-otp/generate", { shipmentId });
+
+// Verifies the OTP entered by the driver. On success the backend records the
+// shipment as OTP-verified, which unlocks the confirmDelivery endpoint.
+export const verifyDeliveryOtp = (shipmentId, otp) =>
+  API.post("/driver/delivery-otp/verify", {
+    shipmentId: String(shipmentId),
+    otp: String(otp),
+  });
+
+
+/**
+ * Builds the URL used to display a Proof of Delivery image (signature or photo)
+ * inside an <img> tag. The token is forwarded as a Bearer header via an Axios
+ * interceptor when loaded through the API instance, but since <img src> cannot
+ * set headers we instead fetch the image as a blob and convert to an object URL.
+ *
+ * @param {number} shipmentId - DB id of the delivered shipment
+ * @param {string} relativePath - value stored in DB, e.g. "delivery/SHIP-ABC/signature.png"
+ * @returns {Promise<string>} object URL safe for <img src>
+ */
+export const fetchPodImage = async (shipmentId, relativePath) => {
+  // Extract only the filename from the relative path stored in DB
+  const filename = relativePath.split("/").pop();
+  const response = await API.get(`/shipments/${shipmentId}/pod/${filename}`, {
+    responseType: "blob",
+  });
+  return URL.createObjectURL(response.data);
+};
+
+
 
 // ForgotPassword
 export const forgotPassword = (data) => API.post("/auth/forgot-password", data);
@@ -98,5 +169,62 @@ export const markNotificationAsRead = (notificationId) =>
   API.put(`/notifications/${notificationId}/read`);
 
 export const markAllNotificationsAsRead = () => API.put("/notifications/read-all");
+
+// ─── Analytics Dashboard ──────────────────────────────────────────────────────
+// period: "today" | "week" | "month" | "all"   (default on backend: "month")
+// limit:  max items returned for ranked lists   (default: 5, max: 20)
+
+/** KPI cards — GET /api/analytics/overview */
+export const getAnalyticsOverview = (period = "month") =>
+  API.get("/analytics/overview", { params: { period } });
+
+/** Chart datasets — GET /api/analytics/charts */
+export const getAnalyticsCharts = (period = "month", limit = 5) =>
+  API.get("/analytics/charts", { params: { period, limit } });
+
+/** Recent activity feed — GET /api/analytics/activity */
+export const getAnalyticsActivity = (limit = 10) =>
+  API.get("/analytics/activity", { params: { limit } });
+
+// ─── Delivery Reports ──────────────────────────────────────────────────────────
+// period: "today" | "week" | "month" | "all"
+// from/to: ISO date strings "YYYY-MM-DD" (optional — override period)
+// format: "pdf" | "excel" | "csv"
+
+/** Delivery Summary KPIs + trends — GET /api/reports/summary */
+export const getDeliverySummary = (period = "month", from = null, to = null) =>
+  API.get("/reports/summary", { params: { period, ...(from && { from }), ...(to && { to }) } });
+
+/** Paginated shipment list with breakdowns — GET /api/reports/shipments */
+export const getShipmentReport = (params = {}) =>
+  API.get("/reports/shipments", { params });
+
+/** Driver performance rankings — GET /api/reports/drivers */
+export const getDriverReport = (period = "all", limit = 20) =>
+  API.get("/reports/drivers", { params: { period, limit } });
+
+/** Business client statistics — GET /api/reports/clients */
+export const getClientReport = (period = "month", from = null, to = null) =>
+  API.get("/reports/clients", { params: { period, ...(from && { from }), ...(to && { to }) } });
+
+/** Route corridor performance — GET /api/reports/routes */
+export const getRouteReport = (period = "month", limit = 10) =>
+  API.get("/reports/routes", { params: { period, limit } });
+
+/**
+ * Export a report as PDF, Excel, or CSV — GET /api/reports/export
+ * Returns a Blob for client-side download.
+ *
+ * @param {string} reportType "summary" | "shipments" | "drivers" | "clients" | "routes"
+ * @param {string} format     "pdf" | "excel" | "csv"
+ * @param {string} period     "today" | "week" | "month" | "all"
+ * @param {string|null} from  ISO date string or null
+ * @param {string|null} to    ISO date string or null
+ */
+export const exportReport = (reportType, format, period = "month", from = null, to = null) =>
+  API.get("/reports/export", {
+    params: { reportType, format, period, ...(from && { from }), ...(to && { to }) },
+    responseType: "blob",
+  });
 
 export default API;

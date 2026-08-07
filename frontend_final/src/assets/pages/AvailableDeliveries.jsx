@@ -3,10 +3,13 @@ import DriverLocationCard from "../components/location/DriverLocationCard";
 
 import {
   acceptShipment,
+  confirmDelivery,
+  generateDeliveryOtp,
   getAvailableShipments,
   getMyShipments,
   rejectShipmentRequest,
   updateDriverLocation,
+  verifyDeliveryOtp,
 } from "../services/api";
 
 // ─────────────────────────────────────────────────────────────────────────────
@@ -85,6 +88,13 @@ const Icon = {
          strokeLinecap="round" strokeLinejoin="round" width={14} height={14} {...props}>
       <line x1="5" y1="12" x2="19" y2="12"/>
       <polyline points="12 5 19 12 12 19"/>
+    </svg>
+  ),
+  Camera: (props) => (
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" strokeWidth={2}
+         strokeLinecap="round" strokeLinejoin="round" width={24} height={24} {...props}>
+      <path d="M23 19a2 2 0 0 1-2 2H3a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h4l2-3h6l2 3h4a2 2 0 0 1 2 2z"/>
+      <circle cx="12" cy="13" r="4"/>
     </svg>
   ),
 };
@@ -352,6 +362,644 @@ function ErrorState({ onRetry }) {
   );
 }
 
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone 3 — Proof of Delivery: Signature Canvas helper
+// ─────────────────────────────────────────────────────────────────────────────
+function SignatureCanvas({ canvasRef, onDraw }) {
+  const drawing = useRef(false);
+
+  const getPos = (e, canvas) => {
+    const rect = canvas.getBoundingClientRect();
+    const src  = e.touches ? e.touches[0] : e;
+    return {
+      x: (src.clientX - rect.left) * (canvas.width  / rect.width),
+      y: (src.clientY - rect.top)  * (canvas.height / rect.height),
+    };
+  };
+
+  const startDraw = (e) => {
+    e.preventDefault();
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    drawing.current = true;
+    const ctx = canvas.getContext("2d");
+    const pos = getPos(e, canvas);
+    ctx.beginPath();
+    ctx.moveTo(pos.x, pos.y);
+  };
+
+  const draw = (e) => {
+    e.preventDefault();
+    if (!drawing.current) return;
+    const canvas = canvasRef.current;
+    const ctx = canvas.getContext("2d");
+    const pos = getPos(e, canvas);
+    ctx.lineWidth   = 2.5;
+    ctx.lineCap     = "round";
+    ctx.strokeStyle = "#1a2744";
+    ctx.lineTo(pos.x, pos.y);
+    ctx.stroke();
+    onDraw();
+  };
+
+  const endDraw = (e) => { e.preventDefault(); drawing.current = false; };
+
+  return (
+    <canvas
+      ref={canvasRef}
+      width={400}
+      height={210}
+      onMouseDown={startDraw}  onMouseMove={draw}  onMouseUp={endDraw}  onMouseLeave={endDraw}
+      onTouchStart={startDraw} onTouchMove={draw}  onTouchEnd={endDraw}
+      style={{
+        width: "100%", height: 210, display: "block",
+        border: "1.5px solid var(--line)", borderRadius: 8,
+        background: "#fff", cursor: "crosshair", touchAction: "none",
+      }}
+    />
+  );
+}
+
+// ─────────────────────────────────────────────────────────────────────────────
+// Milestone 3 — Delivery Confirmation Modal (extended with POD)
+// ─────────────────────────────────────────────────────────────────────────────
+const ALLOWED_PHOTO_TYPES = ["image/jpeg", "image/jpg", "image/png"];
+const MAX_PHOTO_MB        = 5;
+
+function DeliveryConfirmationModal({ shipment, onClose, onConfirmed, showToast }) {
+  const [receiverName,    setReceiverName]    = useState("");
+  const [deliveryRemarks, setDeliveryRemarks] = useState("");
+  const [submitting,      setSubmitting]      = useState(false);
+
+  // ── OTP Verification State (Milestone 4) ────────────────────────────────
+  const [otpSent,          setOtpSent]          = useState(false);
+  const [otpVerified,      setOtpVerified]      = useState(false);
+  const [otpValue,         setOtpValue]         = useState("");
+  const [otpStatus,        setOtpStatus]        = useState(null); // null | "sending" | "verifying" | "verified" | "error"
+  const [otpMessage,       setOtpMessage]       = useState("");
+  const [maskedEmail,      setMaskedEmail]      = useState("");
+  const [resendTimer,      setResendTimer]      = useState(0);
+  const [resendCount,      setResendCount]      = useState(0);
+  const [attemptsLeft,     setAttemptsLeft]     = useState(5);
+  const resendTimerRef = useRef(null);
+
+  // Clean up countdown timer when modal closes
+  useEffect(() => {
+    return () => { if (resendTimerRef.current) clearInterval(resendTimerRef.current); };
+  }, []);
+
+  // Start the 45-second countdown after each OTP send
+  const startResendCountdown = () => {
+    if (resendTimerRef.current) clearInterval(resendTimerRef.current);
+    setResendTimer(45);
+    resendTimerRef.current = setInterval(() => {
+      setResendTimer((prev) => {
+        if (prev <= 1) {
+          clearInterval(resendTimerRef.current);
+          resendTimerRef.current = null;
+          return 0;
+        }
+        return prev - 1;
+      });
+    }, 1000);
+  };
+
+  // Handler: Generate / Resend OTP
+  const handleGenerateOtp = async () => {
+    if (!receiverName.trim()) {
+      setErrors((p) => ({ ...p, receiverName: "Please enter the receiver name before generating OTP." }));
+      return;
+    }
+    setOtpStatus("sending");
+    setOtpMessage("");
+    try {
+      const res = await generateDeliveryOtp(shipment.id);
+      const data = res.data;
+      setMaskedEmail(data.maskedEmail || "");
+      setOtpSent(true);
+      setOtpVerified(false);
+      setOtpValue("");
+      setAttemptsLeft(5);
+      setResendCount((c) => c + 1);
+      setOtpStatus(null);
+      setOtpMessage(`OTP sent to ${data.maskedEmail}. Expires in 45 seconds.`);
+      startResendCountdown();
+    } catch (err) {
+      const msg = err?.response?.data?.message
+        ?? err?.response?.data?.error
+        ?? "Failed to generate OTP. Please try again.";
+      setOtpStatus("error");
+      setOtpMessage(msg);
+    }
+  };
+
+  // Handler: Verify OTP
+  const handleVerifyOtp = async () => {
+    if (otpValue.trim().length !== 6) {
+      setOtpMessage("Please enter the 6-digit OTP.");
+      return;
+    }
+    setOtpStatus("verifying");
+    setOtpMessage("");
+    try {
+      const res = await verifyDeliveryOtp(shipment.id, otpValue.trim());
+      const data = res.data;
+      if (data.success === "true" || data.success === true) {
+        setOtpVerified(true);
+        setOtpStatus("verified");
+        setOtpMessage("✔ Customer identity verified.");
+      } else {
+        const remaining = parseInt(data.attemptsRemaining ?? "0", 10);
+        setAttemptsLeft(remaining);
+        setOtpStatus("error");
+        setOtpMessage(data.message ?? "Incorrect OTP.");
+      }
+    } catch (err) {
+      const msg = err?.response?.data?.message
+        ?? err?.response?.data?.error
+        ?? "Verification failed. Please try again.";
+      setOtpStatus("error");
+      setOtpMessage(msg);
+    }
+  };
+
+  // Signature canvas — useRef so the DOM node is stable across renders
+  const canvasRef  = useRef(null);
+  const [sigEmpty, setSigEmpty] = useState(true);
+
+  // Delivery photo state
+  const [photoFile,  setPhotoFile]  = useState(null);
+  const [photoPreview, setPhotoPreview] = useState(null);
+
+  // Per-field errors
+  const [errors, setErrors] = useState({});
+
+  // ── Signature helpers ───────────────────────────────────────────────────
+  const clearSignature = () => {
+    const canvas = canvasRef.current;
+    if (!canvas) return;
+    canvas.getContext("2d").clearRect(0, 0, canvas.width, canvas.height);
+    setSigEmpty(true);
+    setErrors((p) => ({ ...p, signature: undefined }));
+  };
+
+  const getSignatureBlob = () =>
+    new Promise((resolve) => canvasRef.current.toBlob(resolve, "image/png"));
+
+  // ── Photo helpers ───────────────────────────────────────────────────────
+  const handlePhotoChange = (e) => {
+    const file = e.target.files?.[0];
+    if (!file) return;
+
+    const type = file.type.toLowerCase();
+    if (!ALLOWED_PHOTO_TYPES.includes(type)) {
+      setErrors((p) => ({ ...p, photo: "Only JPG and PNG images are accepted." }));
+      e.target.value = "";
+      return;
+    }
+    if (file.size > MAX_PHOTO_MB * 1024 * 1024) {
+      setErrors((p) => ({ ...p, photo: `Photo must not exceed ${MAX_PHOTO_MB} MB.` }));
+      e.target.value = "";
+      return;
+    }
+    setErrors((p) => ({ ...p, photo: undefined }));
+    setPhotoFile(file);
+    setPhotoPreview(URL.createObjectURL(file));
+  };
+
+  const removePhoto = () => {
+    setPhotoFile(null);
+    if (photoPreview) URL.revokeObjectURL(photoPreview);
+    setPhotoPreview(null);
+  };
+
+  // ── Submission ──────────────────────────────────────────────────────────
+  const handleSubmit = async (e) => {
+    e.preventDefault();
+
+    // Gate: OTP must be verified before submission is allowed
+    if (!otpVerified) {
+      setOtpMessage("Customer identity must be verified before confirming delivery.");
+      return;
+    }
+
+    // Validate all fields before sending anything
+    const next = {};
+    if (!receiverName.trim())  next.receiverName = "Receiver name is required.";
+    if (sigEmpty)              next.signature    = "Customer signature is required.";
+    if (!photoFile)            next.photo        = "Delivery photo is required.";
+    if (Object.keys(next).length > 0) { setErrors(next); return; }
+
+    setErrors({});
+    setSubmitting(true);
+    try {
+      const signatureBlob = await getSignatureBlob();
+
+      const fd = new FormData();
+      fd.append("receiverName",    receiverName.trim());
+      if (deliveryRemarks.trim()) fd.append("deliveryRemarks", deliveryRemarks.trim());
+      fd.append("signature", signatureBlob, "signature.png");
+      fd.append("photo",     photoFile,     photoFile.name);
+
+      await confirmDelivery(shipment.id, fd);
+      showToast(`✓ Delivery confirmed — ${shipment.trackingNumber}`);
+      onConfirmed();
+    } catch (err) {
+      const msg = err?.response?.data?.message ?? "Failed to confirm delivery. Please try again.";
+      showToast(msg, "error");
+    } finally {
+      setSubmitting(false);
+    }
+  };
+
+  // ── Render ──────────────────────────────────────────────────────────────
+  const FieldError = ({ name }) =>
+    errors[name]
+      ? <p style={{ color: "var(--danger)", fontSize: 12, marginTop: 4 }}>{errors[name]}</p>
+      : null;
+
+  return (
+    <div
+      style={{
+        position: "fixed", inset: 0, zIndex: 10000,
+        background: "rgba(10,20,40,0.48)",
+        display: "flex", alignItems: "center", justifyContent: "center",
+        padding: "20px 16px",
+      }}
+      onPointerDown={(e) => { if (e.target === e.currentTarget) onClose(); }}
+    >
+      {/* ── Dialog shell — wide, compact height ── */}
+      <div style={{
+        background: "var(--panel)", borderRadius: 16,
+        boxShadow: "0 28px 72px rgba(10,20,40,0.30)",
+        width: "100%", maxWidth: 760,
+        maxHeight: "92vh", overflowY: "auto",
+        padding: "26px 28px 24px",
+        display: "flex", flexDirection: "column", gap: 0,
+      }}>
+
+        {/* ── Header row ── */}
+        <div style={{ display: "flex", justifyContent: "space-between", alignItems: "flex-start", marginBottom: 14 }}>
+          <div>
+            <div className="eyebrow" style={{ marginBottom: 3, fontSize: 11 }}>Confirm Delivery</div>
+            <strong style={{ fontSize: 16 }}>{shipment.trackingNumber}</strong>
+          </div>
+          <button type="button" onClick={onClose} style={{
+            background: "none", border: "none", cursor: "pointer",
+            padding: 4, color: "var(--muted)", lineHeight: 1,
+          }}>
+            <Icon.X width={18} height={18} />
+          </button>
+        </div>
+
+        {/* ── Route pill ── */}
+        <div style={{
+          background: "#f7fafc", border: "1px solid var(--line)",
+          borderRadius: 8, padding: "8px 14px", marginBottom: 16,
+          fontSize: 13, color: "var(--muted)",
+          display: "flex", alignItems: "center", gap: 8,
+        }}>
+          <Icon.MapPin style={{ color: "var(--brand)", flexShrink: 0, width: 15, height: 15 }} />
+          <span>
+            <strong style={{ color: "var(--ink)" }}>{shipment.originAddress?.city || "—"}</strong>
+            {" → "}
+            <strong style={{ color: "var(--ink)" }}>{shipment.destinationAddress?.city || "—"}</strong>
+          </span>
+        </div>
+
+        <form onSubmit={handleSubmit}>
+          {/* ── Row 1: Receiver Name + Remarks side-by-side ── */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px", marginBottom: 16 }}>
+            <div>
+              <label style={{ display: "block", fontSize: 13, fontWeight: 600, marginBottom: 5 }}>
+                Receiver Name <span style={{ color: "var(--danger)" }}>*</span>
+              </label>
+              <input
+                id="delivery-receiver-name"
+                className="input"
+                type="text"
+                placeholder="Full name of receiver"
+                value={receiverName}
+                onChange={(e) => { setReceiverName(e.target.value); setErrors((p) => ({ ...p, receiverName: undefined })); }}
+                maxLength={150}
+                autoFocus
+                style={{ width: "100%" }}
+              />
+              <FieldError name="receiverName" />
+            </div>
+            <div>
+              <label style={{ display: "block", fontSize: 13, fontWeight: 600, marginBottom: 5 }}>
+                Delivery Remarks <span style={{ color: "var(--muted)", fontWeight: 400 }}>(optional)</span>
+              </label>
+              <textarea
+                id="delivery-remarks"
+                className="input"
+                placeholder='e.g. "Handed to security guard"'
+                value={deliveryRemarks}
+                onChange={(e) => setDeliveryRemarks(e.target.value)}
+                maxLength={500}
+                rows={2}
+                style={{ width: "100%", resize: "none" }}
+              />
+            </div>
+          </div>
+
+          {/* ── OTP Verification Section (Milestone 4) ── */}
+          {/* Inserted between Row 1 and Row 2. No new popup — stays inside this form. */}
+          <div style={{
+            background: otpVerified ? "#f0fdf4" : "#f8fafc",
+            border: `1.5px solid ${otpVerified ? "#6ee7b7" : "#e2e8f0"}`,
+            borderRadius: 10,
+            padding: "14px 16px",
+            marginBottom: 16,
+            transition: "background 0.3s, border-color 0.3s",
+          }}>
+            {/* Section header */}
+            <div style={{ display: "flex", alignItems: "center", justifyContent: "space-between", marginBottom: 10 }}>
+              <div>
+                <div style={{ fontSize: 12, fontWeight: 700, color: otpVerified ? "#059669" : "var(--ink)", textTransform: "uppercase", letterSpacing: "0.05em", marginBottom: 2 }}>
+                  {otpVerified ? "✔ Identity Verified" : "Customer Identity Verification"}
+                </div>
+                <div style={{ fontSize: 12, color: "var(--muted)" }}>
+                  {otpVerified
+                    ? "Customer OTP verified. You may now collect signature and photo."
+                    : "Generate an OTP — the customer will receive it by email and share it with you."
+                  }
+                </div>
+              </div>
+            </div>
+
+            {/* Generate OTP button row */}
+            {!otpVerified && (
+              <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: otpSent ? 10 : 0 }}>
+                <button
+                  id="delivery-generate-otp-btn"
+                  type="button"
+                  className="button primary"
+                  style={{
+                    fontSize: 13, padding: "7px 16px",
+                    opacity: otpStatus === "sending" || !receiverName.trim() ? 0.6 : 1,
+                    cursor: otpStatus === "sending" || !receiverName.trim() ? "not-allowed" : "pointer",
+                  }}
+                  disabled={otpStatus === "sending" || !receiverName.trim()}
+                  onClick={handleGenerateOtp}
+                >
+                  {otpStatus === "sending"
+                    ? "Sending…"
+                    : otpSent ? "Resend OTP" : "Generate OTP"
+                  }
+                </button>
+                {maskedEmail && (
+                  <span style={{ fontSize: 12, color: "var(--muted)" }}>
+                    OTP sent to <strong>{maskedEmail}</strong>
+                  </span>
+                )}
+              </div>
+            )}
+
+            {/* OTP input + Verify row — visible after first send */}
+            {otpSent && !otpVerified && (
+              <div style={{ display: "flex", alignItems: "flex-end", gap: 10, marginBottom: 8 }}>
+                <div style={{ flex: 1 }}>
+                  <label style={{ display: "block", fontSize: 12, fontWeight: 600, marginBottom: 4 }}>
+                    Enter 6-digit OTP
+                  </label>
+                  <input
+                    id="delivery-otp-input"
+                    className="input"
+                    type="text"
+                    inputMode="numeric"
+                    pattern="[0-9]{6}"
+                    maxLength={6}
+                    placeholder="• • • • • •"
+                    value={otpValue}
+                    onChange={(e) => setOtpValue(e.target.value.replace(/\D/g, "").slice(0, 6))}
+                    style={{
+                      width: "100%",
+                      letterSpacing: "0.2em",
+                      textAlign: "center",
+                      fontWeight: 700,
+                      fontSize: 18,
+                    }}
+                    disabled={otpStatus === "verifying"}
+                  />
+                </div>
+                <button
+                  id="delivery-verify-otp-btn"
+                  type="button"
+                  className="button primary"
+                  style={{
+                    fontSize: 13, padding: "7px 18px",
+                    opacity: otpValue.length !== 6 || otpStatus === "verifying" ? 0.6 : 1,
+                    cursor: otpValue.length !== 6 || otpStatus === "verifying" ? "not-allowed" : "pointer",
+                    background: "#059669",
+                    border: "none",
+                  }}
+                  disabled={otpValue.length !== 6 || otpStatus === "verifying"}
+                  onClick={handleVerifyOtp}
+                >
+                  {otpStatus === "verifying" ? "Verifying…" : "Verify OTP"}
+                </button>
+              </div>
+            )}
+
+            {/* Resend timer + attempts remaining */}
+            {otpSent && !otpVerified && (
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginBottom: 6 }}>
+                <button
+                  id="delivery-resend-otp-btn"
+                  type="button"
+                  style={{
+                    fontSize: 11, color: resendTimer > 0 || resendCount >= 3 ? "var(--muted)" : "var(--brand)",
+                    background: "none", border: "none", cursor: resendTimer > 0 || resendCount >= 3 ? "not-allowed" : "pointer",
+                    padding: 0, fontWeight: 600,
+                  }}
+                  disabled={resendTimer > 0 || resendCount >= 3}
+                  onClick={handleGenerateOtp}
+                >
+                  {resendCount >= 3
+                    ? "Resend limit reached"
+                    : resendTimer > 0
+                      ? `Resend in ${resendTimer}s`
+                      : "Resend OTP"
+                  }
+                </button>
+                <span style={{ fontSize: 11, color: "var(--muted)" }}>
+                  Attempts remaining: <strong>{attemptsLeft}</strong>
+                </span>
+              </div>
+            )}
+
+            {/* OTP status message */}
+            {otpMessage && (
+              <div style={{
+                fontSize: 12, fontWeight: 600, marginTop: 4,
+                color: otpStatus === "verified" ? "#059669"
+                     : otpStatus === "error"    ? "var(--danger)"
+                     : "var(--muted)",
+              }}>
+                {otpMessage}
+              </div>
+            )}
+          </div>
+
+          {/* ── Row 2: Signature (left) + Photo (right) ── */}
+          {/* Signature and photo are LOCKED until OTP is verified */}
+          <div style={{ display: "grid", gridTemplateColumns: "1fr 1fr", gap: "0 20px", marginBottom: 18, position: "relative" }}>
+
+            {/* Overlay shown when OTP not yet verified */}
+            {!otpVerified && (
+              <div style={{
+                position: "absolute", inset: 0, zIndex: 2,
+                background: "rgba(248,250,252,0.82)",
+                borderRadius: 8,
+                display: "flex", alignItems: "center", justifyContent: "center",
+                backdropFilter: "blur(2px)",
+              }}>
+                <div style={{
+                  background: "#fff", border: "1.5px solid var(--line)",
+                  borderRadius: 8, padding: "10px 20px",
+                  fontSize: 13, color: "var(--muted)",
+                  fontWeight: 600, textAlign: "center",
+                }}>
+                  🔒 Verify customer OTP to unlock Signature and Photo
+                </div>
+              </div>
+            )}
+
+            {/* LEFT: Signature */}
+            <div>
+              <label style={{ display: "block", fontSize: 13, fontWeight: 600, marginBottom: 5 }}>
+                Customer Signature <span style={{ color: "var(--danger)" }}>*</span>
+              </label>
+              <div style={{
+                border: sigEmpty ? "1.5px dashed var(--line)" : "1.5px solid var(--brand)",
+                borderRadius: 8, overflow: "hidden", background: "#fff",
+              }}>
+                <SignatureCanvas
+                  canvasRef={canvasRef}
+                  onDraw={() => { setSigEmpty(false); setErrors((p) => ({ ...p, signature: undefined })); }}
+                />
+              </div>
+              <div style={{ display: "flex", justifyContent: "space-between", alignItems: "center", marginTop: 6 }}>
+                {sigEmpty
+                  ? <span style={{ fontSize: 11, color: "var(--muted)" }}>Draw with mouse or touch</span>
+                  : <span style={{ fontSize: 11, color: "var(--brand)" }}>✓ Signature captured</span>
+                }
+                {!sigEmpty && (
+                  <button type="button" onClick={clearSignature} style={{
+                    fontSize: 11, color: "var(--muted)", background: "none",
+                    border: "1px solid var(--line)", borderRadius: 5,
+                    padding: "2px 8px", cursor: "pointer",
+                  }}>Clear</button>
+                )}
+              </div>
+              <FieldError name="signature" />
+            </div>
+
+            {/* RIGHT: Delivery Photo */}
+            <div style={{ display: "flex", flexDirection: "column" }}>
+              <label style={{ display: "block", fontSize: 13, fontWeight: 600, marginBottom: 5 }}>
+                Delivery Photo <span style={{ color: "var(--danger)" }}>*</span>
+                <span style={{ color: "var(--muted)", fontWeight: 400, marginLeft: 6 }}>JPG / PNG ≤ {MAX_PHOTO_MB} MB</span>
+              </label>
+
+              {photoPreview ? (
+                <div style={{ position: "relative", flex: 1 }}>
+                  <img
+                    src={photoPreview}
+                    alt="Delivery preview"
+                    style={{
+                      width: "100%", height: 188, objectFit: "cover",
+                      borderRadius: 8, border: "1.5px solid var(--line)", display: "block",
+                    }}
+                  />
+                  <button type="button" onClick={removePhoto} style={{
+                    position: "absolute", top: 6, right: 6,
+                    background: "rgba(10,20,40,0.62)", border: "none",
+                    borderRadius: "50%", width: 24, height: 24,
+                    display: "flex", alignItems: "center", justifyContent: "center",
+                    cursor: "pointer", color: "#fff",
+                  }}>
+                    <Icon.X width={12} height={12} />
+                  </button>
+                  <label htmlFor="delivery-photo-input" style={{
+                    display: "block", marginTop: 6, textAlign: "center",
+                    fontSize: 11, color: "var(--brand)", cursor: "pointer", fontWeight: 600,
+                  }}>Change photo</label>
+                </div>
+              ) : (
+                <label htmlFor="delivery-photo-input" style={{
+                  flex: 1, display: "flex", flexDirection: "column",
+                  alignItems: "center", justifyContent: "center", gap: 8,
+                  border: "1.5px dashed var(--line)", borderRadius: 8,
+                  background: "#f7fafc", cursor: "pointer",
+                  color: "var(--muted)", fontSize: 13, minHeight: 188,
+                  transition: "border-color 0.15s",
+                }}>
+                  <Icon.Camera style={{ width: 28, height: 28, opacity: 0.45 }} />
+                  <span style={{ fontWeight: 600 }}>Upload delivery photo</span>
+                  <span style={{ fontSize: 11 }}>Click to browse</span>
+                </label>
+              )}
+
+              <input
+                id="delivery-photo-input"
+                type="file"
+                accept="image/jpeg,image/jpg,image/png"
+                onChange={handlePhotoChange}
+                style={{ display: "none" }}
+              />
+              <FieldError name="photo" />
+            </div>
+          </div>
+
+          {/* ── Action buttons ── */}
+          <div style={{ display: "flex", gap: 10 }}>
+            <button
+              type="submit"
+              id="delivery-confirm-btn"
+              className="button primary"
+              style={{
+                flex: 1.4,
+                padding: "10px 20px",
+                fontWeight: 700,
+                fontSize: 14,
+                opacity: !otpVerified ? 0.5 : 1,
+                cursor: !otpVerified ? "not-allowed" : "pointer",
+              }}
+              disabled={submitting || !otpVerified}
+            >
+              {submitting ? (
+                <span style={{ display: "flex", alignItems: "center", gap: 8 }}>
+                  <span style={{
+                    width: 14, height: 14,
+                    border: "2px solid rgba(255,255,255,0.35)",
+                    borderTopColor: "#fff", borderRadius: "50%",
+                    display: "inline-block", animation: "spin 0.7s linear infinite",
+                  }} />
+                  Uploading…
+                </span>
+              ) : (
+                <><Icon.CheckCircle /> Confirm Delivery</>
+              )}
+            </button>
+            <button
+              type="button"
+              className="button secondary"
+              style={{ flex: 1 }}
+              disabled={submitting}
+              onClick={onClose}
+            >
+              Cancel
+            </button>
+          </div>
+        </form>
+      </div>
+    </div>
+  );
+}
+
 
 // ────────────────────────────────────────────────────────────────────────────────
 // Main page
@@ -370,6 +1018,9 @@ function AvailableDeliveries() {
   const [autoRefresh, setAutoRefresh] = useState(true);
   const [lastUpdated, setLastUpdated] = useState(null);
   const [totalAccepted, setTotalAccepted] = useState(0);
+
+  // Milestone 3: which shipment's confirmation modal is open (null = closed)
+  const [confirmModal, setConfirmModal] = useState(null);
 
   // Live location state — all logic moved into DriverLocationCard
   // (state kept minimal: showToast is passed as a prop)
@@ -479,6 +1130,16 @@ function AvailableDeliveries() {
       console.error("Reject error", err);
     }
   }, [animateRemove]);
+
+  // ── Delivery Confirmation (Milestone 3) ──────────────────────────────────
+  // After a successful confirmation, trigger a full silent backend refresh
+  // (available shipments + my-shipments) so every counter and card reflects
+  // the real database state — not just an optimistic local update.
+  const handleConfirmDelivery = useCallback(() => {
+    setConfirmModal(null);
+    load(true);
+  }, [load]);
+
 
   // ── Derived data ──────────────────────────────────────────────────────────
   const visible = shipments.filter((s) => !rejected[s.shipmentId]);
@@ -758,14 +1419,26 @@ function AvailableDeliveries() {
                       </div>
                     </div>
 
-                    {/* Hint */}
-                    <div style={{
-                      background: "#f0fdf4", border: "1px solid #bbf7d0",
-                      borderRadius: 8, padding: "8px 12px",
-                      fontSize: 12, color: "#166534",
-                    }}>
-                      ✓ This shipment is assigned to you. Update its status as you make progress.
-                    </div>
+                    {/* Hint — changes for OUT_FOR_DELIVERY to show Confirm Delivery button */}
+                    {status === "OUT_FOR_DELIVERY" ? (
+                      <div style={{ marginTop: 4 }}>
+                        <button
+                          className="button primary"
+                          style={{ width: "100%" }}
+                          onClick={() => setConfirmModal(s)}
+                        >
+                          <Icon.CheckCircle /> Confirm Delivery
+                        </button>
+                      </div>
+                    ) : (
+                      <div style={{
+                        background: "#f0fdf4", border: "1px solid #bbf7d0",
+                        borderRadius: 8, padding: "8px 12px",
+                        fontSize: 12, color: "#166534",
+                      }}>
+                        ✓ This shipment is assigned to you. Update its status as you make progress.
+                      </div>
+                    )}
                   </div>
                 );
               })}
@@ -807,6 +1480,16 @@ function AvailableDeliveries() {
             />
           ))}
         </div>
+      )}
+
+      {/* ── Milestone 3: Delivery Confirmation Modal ── */}
+      {confirmModal && (
+        <DeliveryConfirmationModal
+          shipment={confirmModal}
+          onClose={() => setConfirmModal(null)}
+          onConfirmed={handleConfirmDelivery}
+          showToast={showToast}
+        />
       )}
     </div>
   );

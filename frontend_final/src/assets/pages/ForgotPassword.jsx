@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useState, useEffect } from "react";
 import { Link, useNavigate } from "react-router-dom";
 import { forgotPassword, verifyOtp, resetPassword,} from "../services/api";
 
@@ -13,9 +13,30 @@ function ForgotPassword() {
   });
   const [feedback, setFeedback] = useState({ type: "", message: "" });
 
+  const [timeLeft, setTimeLeft] = useState(0);
+  const [otpExpired, setOtpExpired] = useState(false);
+  const [resending, setResending] = useState(false);
+
   const handleChange = (event) => {
     setForm((current) => ({ ...current, [event.target.name]: event.target.value }));
   };
+
+  useEffect(() => {
+
+    if (timeLeft <= 0) {
+        if (timeLeft === 0) {
+            setOtpExpired(true);
+        }
+        return;
+    }
+
+    const timer = setInterval(() => {
+        setTimeLeft((prev) => prev - 1);
+    }, 1000);
+
+    return () => clearInterval(timer);
+
+}, [timeLeft]);
 
 const handleOtpRequest = async (event) => {
   event.preventDefault();
@@ -30,6 +51,9 @@ const handleOtpRequest = async (event) => {
       message: response.data.message,
     });
 
+    setTimeLeft(120);
+    setOtpExpired(false);
+
     setForm((current) => ({
       ...current,
       step: "verify",
@@ -41,6 +65,34 @@ const handleOtpRequest = async (event) => {
         error.response?.data?.message || "Failed to send OTP.",
     });
   }
+};
+
+const handleResendOtp = async () => {
+    try {
+        setResending(true);
+
+        const response = await forgotPassword({
+            email: form.email,
+        });
+
+        setFeedback({
+            type: "success",
+            message: "A new OTP has been sent successfully.",
+        });
+
+        setTimeLeft(120);
+        setOtpExpired(false);
+
+    } catch (error) {
+        setFeedback({
+            type: "error",
+            message:
+                error.response?.data?.message ||
+                "Failed to resend OTP.",
+        });
+    } finally {
+        setResending(false);
+    }
 };
 
  const handleResetSubmit = async (event) => {
@@ -95,6 +147,13 @@ const handleOtpRequest = async (event) => {
   }
 };
 
+const formatTime = (seconds) => {
+  const mins = Math.floor(seconds / 60);
+  const secs = seconds % 60;
+
+  return `${mins}:${secs.toString().padStart(2, "0")}`;
+};
+
   return (
     <div className="auth-page">
       <section className="auth-panel">
@@ -119,6 +178,61 @@ const handleOtpRequest = async (event) => {
 
           {feedback.message && <div className={`alert ${feedback.type}`}>{feedback.message}</div>}
 
+          {form.step === "verify" && (
+            <div
+              style={{
+                marginTop: "12px",
+                marginBottom: "16px",
+                color: otpExpired ? "#dc2626" : "#2563eb",
+                fontWeight: 600,
+          }}
+        >
+          {otpExpired
+            ? "OTP has expired. Please request a new OTP."
+            : `OTP expires in ${formatTime(timeLeft)}`}
+        </div>
+  )}
+        {form.step === "verify" && (
+    <div style={{ marginBottom: "18px" }}>
+        {otpExpired ? (
+            <button
+                type="button"
+                onClick={handleResendOtp}
+                disabled={resending}
+                style={{
+                    background: "none",
+                    border: "none",
+                    color: "#2563eb",
+                    cursor: "pointer",
+                    fontWeight: 600,
+                    padding: 0,
+                    fontSize: "15px",
+                }}
+            >
+                {resending ? "Sending OTP..." : "🔄 Resend OTP"}
+            </button>
+        ) : (
+            <span
+                style={{
+                  color: "#64748b",
+                  fontSize: "14px",
+                  fontWeight: 500,
+              }}
+          >
+              Didn't receive the OTP?{" "}
+              <span
+                  style={{
+                  color: "#2563eb",
+                  fontWeight: 600,
+                }}
+              >
+                Resend OTP
+              </span>{" "}
+              will be available after the timer expires.
+            </span>
+        )}
+    </div>
+)}
           {form.step === "request" ? (
             <form className="auth-form" onSubmit={handleOtpRequest}>
               <div className="form-field">

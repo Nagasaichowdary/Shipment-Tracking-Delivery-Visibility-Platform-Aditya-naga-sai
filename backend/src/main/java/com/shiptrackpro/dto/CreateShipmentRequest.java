@@ -52,6 +52,22 @@ public class CreateShipmentRequest {
     /** Optional: set if the receiver is a registered platform user. */
     private Long receiverUserId;
 
+    /**
+     * Email address for a guest (non-registered) receiver.
+     *
+     * <p>Required when {@code receiverUserId} is {@code null} (guest customer path).
+     * Must be omitted or {@code null} when {@code receiverUserId} is provided —
+     * the backend will store {@code null} in that case so the registered customer's
+     * email is always resolved from the {@link com.shiptrackpro.entity.User} entity.
+     *
+     * <p>Conditional "required" enforcement is handled in
+     * {@link com.shiptrackpro.service.impl.ShipmentServiceImpl#createShipment} because
+     * standard bean validation cannot cross-reference another field's value.
+     */
+    @jakarta.validation.constraints.Email(message = "Guest email must be a valid email address")
+    @Size(max = 255)
+    private String guestEmail;
+
     @NotNull(message = "Origin address is required")
     @Valid
     private AddressRequest originAddress;

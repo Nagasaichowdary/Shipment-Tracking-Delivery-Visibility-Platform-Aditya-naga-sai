@@ -7,11 +7,13 @@ import org.springframework.http.HttpStatus;
 import org.springframework.http.ResponseEntity;
 import org.springframework.security.authentication.BadCredentialsException;
 import org.springframework.security.core.AuthenticationException;
+import org.springframework.web.bind.MethodArgumentNotValidException;
 import org.springframework.web.bind.annotation.ExceptionHandler;
 import org.springframework.web.bind.annotation.RestControllerAdvice;
 
 import java.util.LinkedHashMap;
 import java.util.Map;
+import java.util.stream.Collectors;
 
 @RestControllerAdvice
 public class GlobalExceptionHandler {
@@ -73,6 +75,24 @@ public class GlobalExceptionHandler {
     public ResponseEntity<?> handleShipmentConflict(ShipmentConflictException ex) {
         return ResponseEntity.status(HttpStatus.CONFLICT)
                 .body(Map.of("message", ex.getMessage()));
+    }
+
+    /**
+     * Handles Bean Validation failures triggered by {@code @Valid} on request bodies
+     * (e.g. {@code @NotBlank}, {@code @Size} on {@link com.shiptrackpro.dto.DeliveryConfirmationRequest}).
+     *
+     * <p>Without this handler, Spring returns its own verbose error body which the
+     * frontend cannot surface as a human-readable message. This handler collects every
+     * field error and joins them into a single {@code message} string matching the
+     * format expected by every other error response in this application.</p>
+     */
+    @ExceptionHandler(MethodArgumentNotValidException.class)
+    public ResponseEntity<?> handleValidation(MethodArgumentNotValidException ex) {
+        String message = ex.getBindingResult().getFieldErrors().stream()
+                .map(fe -> fe.getDefaultMessage())
+                .collect(Collectors.joining("; "));
+        return ResponseEntity.status(HttpStatus.BAD_REQUEST)
+                .body(Map.of("message", message.isBlank() ? "Validation failed." : message));
     }
 
     /**

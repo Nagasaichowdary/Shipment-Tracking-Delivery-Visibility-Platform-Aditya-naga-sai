@@ -1,7 +1,8 @@
 import { useCallback, useContext, useEffect, useMemo, useRef, useState } from "react";
 import { useLocation } from "react-router-dom";
 import { ShipmentContext } from "../context/shipments";
-import { getShipmentDriver, getShipmentDriverLocation, getShipmentDelay, getShipmentLocation } from "../services/api";
+import { getShipmentDriver, getShipmentDriverLocation, getShipmentDelay, getShipmentLocation, fetchPodImage, downloadPodPdf } from "../services/api";
+import { AuthContext } from "../context/auth";
 import { getCityCoordinates, estimateRoute, haversineKm } from "../utils/cityCoordinates";
 
 
@@ -74,6 +75,218 @@ function formatDelayMinutes(mins) {
   if (h > 0) parts.push(`${h} hour${h !== 1 ? "s" : ""}`);
   if (m > 0 || parts.length === 0) parts.push(`${m} minute${m !== 1 ? "s" : ""}`);
   return parts.join(" ");
+}
+
+// ──────────────────────────────────────────────────────────────────────
+// Proof of Delivery Card
+// ──────────────────────────────────────────────────────────────────────
+function PodImage({ shipmentId, relativePath, alt, style }) {
+  const [src, setSrc] = useState(null);
+  const [loading, setLoading] = useState(true);
+  const [error, setError] = useState(false);
+  const [lightbox, setLightbox] = useState(false);
+
+  useEffect(() => {
+    if (!relativePath || !shipmentId) return;
+    let objectUrl;
+    setLoading(true);
+    setError(false);
+    fetchPodImage(shipmentId, relativePath)
+      .then((url) => { objectUrl = url; setSrc(url); })
+      .catch(() => setError(true))
+      .finally(() => setLoading(false));
+    return () => { if (objectUrl) URL.revokeObjectURL(objectUrl); };
+  }, [shipmentId, relativePath]);
+
+  if (loading) return (
+    <div style={{
+      ...style, display: "flex", alignItems: "center", justifyContent: "center",
+      background: "#f1f5f9", borderRadius: 8, color: "#94a3b8", fontSize: 13,
+    }}>
+      Loading…
+    </div>
+  );
+  if (error || !src) return (
+    <div style={{
+      ...style, display: "flex", alignItems: "center", justifyContent: "center",
+      background: "#f1f5f9", borderRadius: 8, color: "#94a3b8", fontSize: 13,
+    }}>
+      Image unavailable
+    </div>
+  );
+
+  return (
+    <>
+      <img
+        src={src} alt={alt}
+        onClick={() => setLightbox(true)}
+        style={{
+          ...style, cursor: "zoom-in", objectFit: "contain",
+          borderRadius: 8, border: "1.5px solid #e2e8f0", background: "#fff",
+        }}
+      />
+      {lightbox && (
+        <div
+          onClick={() => setLightbox(false)}
+          style={{
+            position: "fixed", inset: 0, zIndex: 99999,
+            background: "rgba(0,0,0,0.82)",
+            display: "flex", alignItems: "center", justifyContent: "center",
+            cursor: "zoom-out", padding: 24,
+          }}
+        >
+          <img
+            src={src} alt={alt}
+            style={{ maxWidth: "92vw", maxHeight: "88vh", borderRadius: 10, boxShadow: "0 8px 40px rgba(0,0,0,0.5)" }}
+          />
+        </div>
+      )}
+    </>
+  );
+}
+
+function ProofOfDeliveryCard({ shipment }) {
+  const raw = shipment._raw;
+  const { auth } = useContext(AuthContext);
+  const [pdfLoading, setPdfLoading] = useState(false);
+  const [pdfError,   setPdfError]   = useState("");
+
+  if (!raw?.deliveryConfirmed) return null;
+
+  const rows = [
+    { label: "Receiver Name",   value: raw.deliveryReceiverName || "—" },
+    { label: "Delivered By",    value: raw.assignedDriverName   || "—" },
+    { label: "Delivered At",    value: raw.deliveredAt ? formatDateTime(raw.deliveredAt) : "—" },
+    { label: "Delivery Remarks", value: raw.deliveryRemarks      || "—" },
+  ];
+
+  const handleDownloadPdf = async () => {
+    setPdfError("");
+    setPdfLoading(true);
+    try {
+      const response = await downloadPodPdf(shipment.id);
+      const blob = new Blob([response.data], { type: "application/pdf" });
+      const url  = URL.createObjectURL(blob);
+      const a    = document.createElement("a");
+      a.href     = url;
+      a.download = `POD-${raw.trackingNumber || shipment.id}.pdf`;
+      document.body.appendChild(a);
+      a.click();
+      document.body.removeChild(a);
+      URL.revokeObjectURL(url);
+    } catch (err) {
+      const status = err?.response?.status;
+      if (status === 403) {
+        setPdfError("You do not have permission to download this document.");
+      } else if (status === 400) {
+        setPdfError("PDF is only available for delivered shipments.");
+      } else {
+        setPdfError("Failed to generate PDF. Please try again.");
+      }
+    } finally {
+      setPdfLoading(false);
+    }
+  };
+
+  return (
+    <div
+      className="schema-box"
+      style={{
+        marginTop: 16,
+        border: "1.5px solid #2563eb",
+        borderRadius: 12,
+        padding: "20px 22px 22px",
+        background: "rgba(37,99,235,0.03)",
+      }}
+    >
+      {/* Header */}
+      <div style={{ display: "flex", alignItems: "center", gap: 10, marginBottom: 18 }}>
+        <span style={{ fontSize: 22 }}>📦</span>
+        <strong style={{ fontSize: 16, color: "#1e3a5f" }}>Proof of Delivery</strong>
+        <span style={{
+          marginLeft: "auto", fontSize: 11, fontWeight: 700,
+          background: "#22c55e", color: "#fff",
+          borderRadius: 6, padding: "2px 10px", textTransform: "uppercase",
+        }}>Confirmed</span>
+      </div>
+
+      {/* Receiver info table */}
+      <div style={{
+        display: "grid", gridTemplateColumns: "140px 1fr",
+        gap: "8px 12px", marginBottom: 20,
+      }}>
+        {rows.map(({ label, value }) => (
+          <>
+            <span key={label + "-l"} style={{ fontSize: 12, fontWeight: 600, color: "#64748b", paddingTop: 2 }}>{label}</span>
+            <span key={label + "-v"} style={{ fontSize: 13, color: "#1e293b", wordBreak: "break-word" }}>{value}</span>
+          </>
+        ))}
+      </div>
+
+      <div style={{ height: 1, background: "#e2e8f0", marginBottom: 18 }} />
+
+      {/* Two-column: Signature | Photo */}
+      <div style={{
+        display: "grid",
+        gridTemplateColumns: "repeat(auto-fit, minmax(220px, 1fr))",
+        gap: 20,
+      }}>
+        {/* Customer Signature */}
+        {raw.customerSignaturePath && (
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "#64748b", marginBottom: 8 }}>Customer Signature</div>
+            <PodImage
+              shipmentId={shipment.id}
+              relativePath={raw.customerSignaturePath}
+              alt="Customer signature"
+              style={{ width: "100%", height: 140, display: "block" }}
+            />
+          </div>
+        )}
+
+        {/* Delivery Photo */}
+        {raw.deliveryPhotoPath && (
+          <div>
+            <div style={{ fontSize: 12, fontWeight: 600, color: "#64748b", marginBottom: 8 }}>Delivery Photo</div>
+            <PodImage
+              shipmentId={shipment.id}
+              relativePath={raw.deliveryPhotoPath}
+              alt="Delivery photo"
+              style={{ width: "100%", height: 140, display: "block" }}
+            />
+          </div>
+        )}
+      </div>
+
+      {/* Download PDF button */}
+      <div style={{ marginTop: 20, borderTop: "1px solid #e2e8f0", paddingTop: 16 }}>
+        {pdfError && (
+          <div style={{
+            marginBottom: 10, padding: "8px 12px", borderRadius: 6,
+            background: "rgba(239,68,68,0.07)", border: "1px solid rgba(239,68,68,0.22)",
+            color: "#b91c1c", fontSize: 12,
+          }}>
+            {pdfError}
+          </div>
+        )}
+        <button
+          className="button"
+          onClick={handleDownloadPdf}
+          disabled={pdfLoading}
+          style={{
+            display: "flex", alignItems: "center", gap: 8,
+            background: "#2563eb", color: "#fff", border: "none",
+            borderRadius: 8, padding: "9px 20px", fontSize: 13,
+            fontWeight: 600, cursor: pdfLoading ? "not-allowed" : "pointer",
+            opacity: pdfLoading ? 0.7 : 1, transition: "opacity 0.2s",
+          }}
+        >
+          <span style={{ fontSize: 16 }}>⬇️</span>
+          {pdfLoading ? "Generating PDF…" : "Download Proof of Delivery (PDF)"}
+        </button>
+      </div>
+    </div>
+  );
 }
 
 function TrackShipment() {
@@ -266,6 +479,15 @@ function TrackShipment() {
   // Falls back to the static status-based percentage when GPS is not yet available.
   // Clamped to [0, 100]; never goes negative or exceeds 100%.
   const gpsProgress = useMemo(() => {
+    // Terminal statuses: GPS geometry is no longer meaningful — the driver's
+    // last-known position is stale. Always use the status-based progress from
+    // ShipmentContext (DELIVERED=100, CANCELLED=0, etc.) as the single source
+    // of truth.  This keeps the value consistent with the Shipment Management page.
+    const TERMINAL_STATUSES = ["DELIVERED", "CANCELLED", "RETURNED", "FAILED_DELIVERY"];
+    if (TERMINAL_STATUSES.includes(shipment?.status)) {
+      return shipment?.progress ?? 0;
+    }
+
     const { totalKm, remainingKm } = routeSummaryInfo ?? {};
     if (totalKm > 0 && remainingKm != null) {
       return Math.max(0, Math.min(100,
@@ -273,7 +495,7 @@ function TrackShipment() {
       ));
     }
     return shipment?.progress ?? 0;
-  }, [routeSummaryInfo, shipment?.progress]);
+  }, [routeSummaryInfo, shipment?.progress, shipment?.status]);
   // ───────────────────────────────────────────────────────────────────────────
 
   return (
@@ -587,22 +809,27 @@ function TrackShipment() {
 
           {/* DELIVERED state — replace everything with success banner */}
           {isDelivered ? (
-            <div
-              className="schema-box"
-              style={{
-                textAlign: "center",
-                padding: "32px 24px",
-                background: "rgba(34,197,94,0.07)",
-                border: "1.5px solid #22c55e",
-                borderRadius: 10,
-              }}
-            >
-              <div style={{ fontSize: 40, marginBottom: 10 }}>✅</div>
-              <strong style={{ fontSize: 18, color: "#22c55e" }}>Delivered Successfully</strong>
-              <p className="subtle" style={{ margin: "8px 0 0" }}>
-                This shipment has been delivered. Live tracking is no longer active.
-              </p>
-            </div>
+            <>
+              <div
+                className="schema-box"
+                style={{
+                  textAlign: "center",
+                  padding: "32px 24px",
+                  background: "rgba(34,197,94,0.07)",
+                  border: "1.5px solid #22c55e",
+                  borderRadius: 10,
+                }}
+              >
+                <div style={{ fontSize: 40, marginBottom: 10 }}>✅</div>
+                <strong style={{ fontSize: 18, color: "#22c55e" }}>Delivered Successfully</strong>
+                <p className="subtle" style={{ margin: "8px 0 0" }}>
+                  This shipment has been delivered. Live tracking is no longer active.
+                </p>
+              </div>
+
+              {/* Proof of Delivery card — shown below the success banner */}
+              <ProofOfDeliveryCard shipment={shipment} />
+            </>
 
           ) : !driverData && !fetchingDriver ? (
             // Distinguish: driver assigned but pending acceptance vs truly no driver

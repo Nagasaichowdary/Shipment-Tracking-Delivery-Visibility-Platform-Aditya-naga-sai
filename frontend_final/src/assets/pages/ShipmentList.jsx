@@ -32,6 +32,9 @@ function ShipmentList() {
 
 
   const canEditStatus = editableRoles.includes(auth.user.role);
+  // RBAC: same pattern as Dashboard line 112 — Customer and Driver cannot create shipments.
+  const roleKey = (auth.user.role || "").toLowerCase();
+  const canCreateShipment = roleKey !== "customer" && roleKey !== "driver";
 
   const filteredShipments = useMemo(() => {
     const normalizedQuery = query.trim().toLowerCase();
@@ -60,9 +63,11 @@ function ShipmentList() {
           <h1>Management dashboard</h1>
           <p className="subtle">Filter shipments, review route progress, and update lifecycle status.</p>
         </div>
-        <Link className="button primary" to="/shipments/new">
-          + New shipment
-        </Link>
+        {canCreateShipment && (
+          <Link className="button primary" to="/shipments/new">
+            + New shipment
+          </Link>
+        )}
       </div>
 
       <section className="grid grid-4" style={{ marginBottom: 18 }}>
@@ -153,47 +158,59 @@ function ShipmentList() {
                   </td>
                   <td>{shipment.eta}</td>
                   <td>
-                    {canEditStatus ? (
-                      (() => {
-                        return (
-                          <select
-                            className="select"
-                            onChange={async (event) => {
-                              const newStatus = event.target.value;
-                              if (newStatus === "CANCELLED") {
-                                setCancellingShipment(shipment);
-                                setCancellationReason("Driver unavailable");
-                                setCustomReason("");
-                              } else if (newStatus === "DELAYED") {
-                                setDelayingShipment(shipment);
-                                setDelayReason("Heavy Traffic");
-                                setCustomDelayReason("");
-                              } else {
-                                try {
-                                  await updateStatus(shipment.trackingNumber, newStatus, shipment.receiverCity);
-                                } catch (err) {
-                                  console.error("Status update failed:", err?.response?.data?.message || err);
+                    <div style={{ display: "flex", alignItems: "center", gap: "0.5rem", flexWrap: "wrap" }}>
+                      {canEditStatus ? (
+                        (() => {
+                          return (
+                            <select
+                              className="select"
+                              onChange={async (event) => {
+                                const newStatus = event.target.value;
+                                if (newStatus === "CANCELLED") {
+                                  setCancellingShipment(shipment);
+                                  setCancellationReason("Driver unavailable");
+                                  setCustomReason("");
+                                } else if (newStatus === "DELAYED") {
+                                  setDelayingShipment(shipment);
+                                  setDelayReason("Heavy Traffic");
+                                  setCustomDelayReason("");
+                                } else {
+                                  try {
+                                    await updateStatus(shipment.trackingNumber, newStatus, shipment.receiverCity);
+                                  } catch (err) {
+                                    console.error("Status update failed:", err?.response?.data?.message || err);
+                                  }
                                 }
-                              }
-                            }}
-                            title="Update shipment status"
-                            value={shipment.status}
-                          >
-                            {statuses.map((item) => (
-                              <option key={item}>{item}</option>
-                            ))}
-                          </select>
-                        );
-                      })()
-                    ) : (
+                              }}
+                              title="Update shipment status"
+                              value={shipment.status}
+                            >
+                              {statuses.map((item) => (
+                                <option key={item}>{item}</option>
+                              ))}
+                            </select>
+                          );
+                        })()
+                      ) : (
+                        <button
+                          className="button secondary"
+                          onClick={() => navigate("/track", { state: { trackingNumber: shipment.trackingNumber } })}
+                          type="button"
+                        >
+                          Track
+                        </button>
+                      )}
                       <button
-                        className="button secondary"
-                        onClick={() => navigate("/track", { state: { trackingNumber: shipment.trackingNumber } })}
+                        className="btn-route-history"
+                        title="View full route history"
                         type="button"
+                        onClick={() =>
+                          navigate(`/shipments/${shipment.trackingNumber}/route-history`)
+                        }
                       >
-                        Track
+                        🗺 History
                       </button>
-                    )}
+                    </div>
                   </td>
                 </tr>
               ))}

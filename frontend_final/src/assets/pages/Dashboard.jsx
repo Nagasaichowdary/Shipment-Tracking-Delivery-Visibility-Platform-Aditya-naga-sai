@@ -107,9 +107,13 @@ const roleKey = (auth?.user?.role || "").toLowerCase();
             </div>
           </div>
         </div>
-        <Link className="button primary" to="/shipments/new">
-          + New shipment
-        </Link>
+        {/* RBAC: only roles that can create shipments see this button.
+              Customer and Driver have no shipment-creation permission. */}
+        {roleKey !== "customer" && roleKey !== "driver" && (
+          <Link className="button primary" to="/shipments/new">
+            + New shipment
+          </Link>
+        )}
       </div>
 
       <section className="grid grid-4">

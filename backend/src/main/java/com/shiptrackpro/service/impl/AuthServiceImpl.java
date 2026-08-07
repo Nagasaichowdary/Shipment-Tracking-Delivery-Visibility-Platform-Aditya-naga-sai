@@ -4,6 +4,7 @@ import com.shiptrackpro.dto.*;
 import com.shiptrackpro.entity.BusinessClient;
 import com.shiptrackpro.entity.RegistrationStatus;
 import com.shiptrackpro.entity.Role;
+import com.shiptrackpro.entity.Shipment;
 import com.shiptrackpro.entity.User;
 import com.shiptrackpro.exception.EmailAlreadyExistsException;
 import com.shiptrackpro.exception.EmailNotVerifiedException;
@@ -12,7 +13,9 @@ import com.shiptrackpro.exception.PendingApprovalException;
 import com.shiptrackpro.exception.RegistrationRejectedException;
 import com.shiptrackpro.repository.BusinessClientRepository;
 import com.shiptrackpro.repository.RoleRepository;
+import com.shiptrackpro.repository.ShipmentRepository;
 import com.shiptrackpro.repository.UserRepository;
+import com.shiptrackpro.enums.ShipmentStatus;
 import com.shiptrackpro.security.JwtService;
 import com.shiptrackpro.service.AuthService;
 import org.springframework.beans.factory.annotation.Autowired;
@@ -52,6 +55,7 @@ public class AuthServiceImpl implements AuthService {
     @Autowired private UserRepository userRepository;
     @Autowired private RoleRepository roleRepository;
     @Autowired private BusinessClientRepository businessClientRepository;
+    @Autowired private ShipmentRepository shipmentRepository;
     @Autowired private PasswordEncoder passwordEncoder;
     @Autowired private AuthenticationManager authenticationManager;
     @Autowired private JwtService jwtService;
@@ -80,15 +84,51 @@ public class AuthServiceImpl implements AuthService {
     /** Forgot-password OTPs keyed by normalised email */
     private final Map<String, String> forgotPasswordOtpStore = new HashMap<>();
 
-    // ── Inner helper ────────────────────────────────────────────
+    /**
+     * Delivery OTPs keyed by shipmentId.
+     * Each entry tracks: the OTP value, expiry, attempt count, and resend count.
+     */
+    private final Map<Long, DeliveryOtpEntry> deliveryOtpStore = new ConcurrentHashMap<>();
 
+    /**
+     * Shipment IDs whose delivery OTP has been successfully verified.
+     * ShipmentServiceImpl.confirmDelivery() checks this set before allowing
+     * the shipment to transition to DELIVERED. This is the backend security gate.
+     */
+    private final Set<Long> deliveryVerifiedSet = ConcurrentHashMap.newKeySet();
+
+    // ── Inner helpers ───────────────────────────────────────────
+
+    /** Registration OTP: 2-minute expiry, no attempt tracking needed. */
     private static class OtpEntry {
         final String otp;
         final Instant expiresAt;
 
         OtpEntry(String otp) {
             this.otp = otp;
-            this.expiresAt = Instant.now().plusSeconds(300); // 5 minutes
+            this.expiresAt = Instant.now().plusSeconds(120); // 2 minutes
+        }
+
+        boolean isExpired() {
+            return Instant.now().isAfter(expiresAt);
+        }
+    }
+
+    /**
+     * Delivery OTP entry: 2-minute expiry, tracks verification attempts and
+     * resend attempts to enforce the security limits.
+     */
+    private static class DeliveryOtpEntry {
+        final String otp;
+        final Instant expiresAt;
+        int attemptCount;  // max 5 — incremented on each wrong guess
+        int resendCount;   // max 3 — incremented on each new OTP generated
+
+        DeliveryOtpEntry(String otp, int resendCount) {
+            this.otp         = otp;
+            this.expiresAt   = Instant.now().plusSeconds(120); // 2 minutes
+            this.attemptCount = 0;
+            this.resendCount  = resendCount;
         }
 
         boolean isExpired() {
@@ -119,7 +159,7 @@ public class AuthServiceImpl implements AuthService {
         registrationOtpStore.put(email, entry);
 
         // Attempt to deliver the OTP via email; fall back to console
-        sendOtpEmail(email, otp);
+        sendOtpEmail(email, otp, "REGISTRATION"); // TEMPORARY-DIAG caller label
 
         // Return masked email + expiry epoch-ms so the frontend can
         // calculate remaining time from the real server timestamp
@@ -366,8 +406,7 @@ public class AuthServiceImpl implements AuthService {
         String otp = String.format("%06d", new SecureRandom().nextInt(1_000_000));
         forgotPasswordOtpStore.put(email, otp);
 
-        sendOtpEmail(email, otp);
-        System.out.println("[ShipTrackPro] Forgot-password OTP for " + email + " → " + otp);
+        sendOtpEmail(email, otp, "FORGOT-PASSWORD");
 
         return Map.of(
                 "success",     "true",
@@ -404,13 +443,178 @@ public class AuthServiceImpl implements AuthService {
         return Map.of("success", "true", "message", "Password reset successfully.");
     }
 
+    // ── Delivery OTP Flow ────────────────────────────────────────
+
+    @Override
+    public Map<String, String> generateDeliveryOtp(Long shipmentId, String driverEmail) {
+
+        // 1. Load shipment and verify driver assignment
+        Shipment shipment = shipmentRepository.findById(shipmentId)
+                .orElseThrow(() -> new RuntimeException("Shipment not found with id: " + shipmentId));
+
+        validateDriverAssignment(shipment, driverEmail);
+
+        // 2. Shipment must be OUT_FOR_DELIVERY before OTP can be generated
+        if (shipment.getShipmentStatus() != ShipmentStatus.OUT_FOR_DELIVERY) {
+            throw new RuntimeException(
+                    "Delivery OTP can only be generated when the shipment is OUT_FOR_DELIVERY. " +
+                    "Current status: " + shipment.getShipmentStatus());
+        }
+
+        // 3. Enforce resend limit — check existing entry for resend count
+        DeliveryOtpEntry existing = deliveryOtpStore.get(shipmentId);
+        int currentResendCount = (existing != null) ? existing.resendCount : 0;
+        if (currentResendCount >= 3) {
+            throw new RuntimeException(
+                    "Maximum OTP resend limit (3) reached for this shipment. " +
+                    "Please contact support if the customer did not receive the OTP.");
+        }
+
+        // 4. Resolve delivery email — registered customer takes priority over guest email.
+        //    The driver NEVER supplies or sees the email address; the backend resolves it
+        //    entirely from the database so drivers cannot manipulate the destination.
+        //
+        //    Path A (Registered customer): receiverUser was linked during shipment creation.
+        //    Path B (Guest customer):      guestEmail was collected from the operator form.
+        //    Path C (Neither):             OTP cannot be sent — operator must fix the shipment.
+        final String customerEmail;
+        User receiverUser = shipment.getReceiverUser();
+        if (receiverUser != null && receiverUser.getEmail() != null
+                && !receiverUser.getEmail().isBlank()) {
+            // Path A — registered customer
+            customerEmail = receiverUser.getEmail();
+        } else if (shipment.getGuestEmail() != null && !shipment.getGuestEmail().isBlank()) {
+            // Path B — guest customer (email stored at shipment creation time)
+            customerEmail = shipment.getGuestEmail();
+        } else {
+            // Path C — no email available; OTP impossible
+            throw new RuntimeException(
+                    "No email address is associated with this shipment. " +
+                    "OTP-based delivery verification cannot be performed. " +
+                    "Please contact the logistics operator to update the shipment.");
+        }
+
+        // 5. Generate a cryptographically secure 6-digit OTP
+        String otp = String.format("%06d", new SecureRandom().nextInt(1_000_000));
+
+        // 6. Store OTP — overwrites any previous OTP, invalidating it immediately
+        int nextResendCount = currentResendCount + 1;
+        DeliveryOtpEntry entry = new DeliveryOtpEntry(otp, nextResendCount);
+        deliveryOtpStore.put(shipmentId, entry);
+
+        // 7. Remove any previous OTP-verified status for this shipment
+        //    (resend must re-verify — old verification is invalid)
+        deliveryVerifiedSet.remove(shipmentId);
+
+        // 8. Send OTP email to customer
+        sendDeliveryOtpEmail(customerEmail, otp);
+
+        System.out.println("[ShipTrackPro] Delivery OTP generated for shipment " + shipmentId +
+                " → sent to " + maskEmail(customerEmail) + " (resend #" + nextResendCount + ")");
+
+        return Map.of(
+                "success",          "true",
+                "maskedEmail",      maskEmail(customerEmail),
+                "expiresAt",        String.valueOf(entry.expiresAt.toEpochMilli()),
+                "message",          "OTP sent to the registered customer.",
+                "resendsRemaining", String.valueOf(3 - nextResendCount)
+        );
+    }
+
+    @Override
+    public Map<String, String> verifyDeliveryOtp(Long shipmentId, String driverEmail, String otp) {
+
+        // 1. Load shipment and verify driver assignment
+        Shipment shipment = shipmentRepository.findById(shipmentId)
+                .orElseThrow(() -> new RuntimeException("Shipment not found with id: " + shipmentId));
+
+        validateDriverAssignment(shipment, driverEmail);
+
+        // 2. Retrieve OTP entry
+        DeliveryOtpEntry entry = deliveryOtpStore.get(shipmentId);
+        if (entry == null) {
+            return Map.of(
+                    "success", "false",
+                    "message", "No OTP found for this shipment. Please generate a new OTP.",
+                    "attemptsRemaining", "0"
+            );
+        }
+
+        // 3. Check expiry
+        if (entry.isExpired()) {
+            deliveryOtpStore.remove(shipmentId);
+            return Map.of(
+                    "success", "false",
+                    "message", "OTP has expired (120 seconds). Please request a new one.",
+                    "attemptsRemaining", "0"
+            );
+        }
+
+        // 4. Check attempt limit
+        if (entry.attemptCount >= 5) {
+            deliveryOtpStore.remove(shipmentId);
+            return Map.of(
+                    "success", "false",
+                    "message", "Maximum verification attempts (5) exceeded. Please request a new OTP.",
+                    "attemptsRemaining", "0"
+            );
+        }
+
+        // 5. Verify OTP value
+        if (!entry.otp.equals(otp)) {
+            entry.attemptCount++;
+            int remaining = 5 - entry.attemptCount;
+            return Map.of(
+                    "success", "false",
+                    "message", "Incorrect OTP. Please try again.",
+                    "attemptsRemaining", String.valueOf(remaining)
+            );
+        }
+
+        // 6. OTP is correct — record verification and clear OTP
+        deliveryVerifiedSet.add(shipmentId);
+        deliveryOtpStore.remove(shipmentId);
+
+        System.out.println("[ShipTrackPro] Delivery OTP verified for shipment " + shipmentId +
+                " by driver " + driverEmail);
+
+        return Map.of(
+                "success", "true",
+                "message", "Customer identity verified. You may now complete the delivery."
+        );
+    }
+
+    @Override
+    public boolean isDeliveryOtpVerified(Long shipmentId) {
+        return deliveryVerifiedSet.contains(shipmentId);
+    }
+
+    @Override
+    public void clearDeliveryOtpVerification(Long shipmentId) {
+        deliveryVerifiedSet.remove(shipmentId);
+        // Also clear any pending OTP (e.g., if delivery confirmed without further resends)
+        deliveryOtpStore.remove(shipmentId);
+    }
+
+    /**
+     * Validates that the authenticated driver is the one assigned to the shipment.
+     * Throws RuntimeException if the assignment does not match.
+     */
+    private void validateDriverAssignment(Shipment shipment, String driverEmail) {
+        User assignedDriver = shipment.getAssignedDriver();
+        if (assignedDriver == null || !assignedDriver.getEmail().equalsIgnoreCase(driverEmail)) {
+            throw new RuntimeException(
+                    "You are not the assigned driver for shipment " + shipment.getTrackingNumber() + ".");
+        }
+    }
+
     // ── Private Helpers ─────────────────────────────────────────
 
     /**
-     * Sends OTP via Gmail SMTP if mailSender is configured,
-     * otherwise prints to console as a safe development fallback.
+     * Sends an OTP email using the appropriate template for the caller type.
+     * Supported callers: "REGISTRATION", "FORGOT-PASSWORD", "DELIVERY".
      */
-    private void sendOtpEmail(String toEmail, String otp) {
+    private void sendOtpEmail(String toEmail, String otp, String caller) {
         boolean mailConfigured = mailSender != null
                 && mailFromAddress != null
                 && !mailFromAddress.isBlank()
@@ -419,8 +623,9 @@ public class AuthServiceImpl implements AuthService {
         if (!mailConfigured) {
             System.out.println("=========================================");
             System.out.println("[ShipTrackPro] Mail not configured — console fallback.");
-            System.out.println("Email : " + toEmail);
-            System.out.println("OTP   : " + otp);
+            System.out.println("Caller : " + caller);
+            System.out.println("Email  : " + toEmail);
+            System.out.println("OTP    : " + otp);
             System.out.println("=========================================");
             return;
         }
@@ -428,20 +633,62 @@ public class AuthServiceImpl implements AuthService {
         try {
             MimeMessage message = mailSender.createMimeMessage();
             MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
-            // Gmail SMTP: from address MUST match the authenticated account
             helper.setFrom(mailFromAddress, "Shipment Tracker Pro");
             helper.setTo(toEmail);
-            helper.setSubject("Your Shipment Tracker Pro Verification Code — " + otp);
-            helper.setText(buildEmailTemplate(otp), true);
+
+            switch (caller) {
+                case "FORGOT-PASSWORD" -> {
+                    helper.setSubject("Shipment Tracker Pro — Password Reset Code");
+                    helper.setText(buildForgotPasswordEmailTemplate(otp), true);
+                }
+                default -> {
+                    // REGISTRATION and any other caller uses the registration template
+                    helper.setSubject("Your Shipment Tracker Pro Verification Code");
+                    helper.setText(buildEmailTemplate(otp), true);
+                }
+            }
+
             mailSender.send(message);
-            System.out.println("[ShipTrackPro] OTP email dispatched to: " + toEmail);
+            System.out.println("[ShipTrackPro] OTP email dispatched to: " + toEmail + " [" + caller + "]");
         } catch (Exception e) {
-            // Fallback — do NOT block the user; log OTP to console
+            System.out.println("[ShipTrackPro] Email delivery failed for " + toEmail +
+                    " [" + caller + "]: " + e.getMessage());
+        }
+    }
+
+    /**
+     * Sends a delivery OTP email to the customer.
+     * Uses a dedicated green-themed template clearly distinct from Registration
+     * (blue) and Forgot-Password (blue) templates.
+     */
+    private void sendDeliveryOtpEmail(String toEmail, String otp) {
+        boolean mailConfigured = mailSender != null
+                && mailFromAddress != null
+                && !mailFromAddress.isBlank()
+                && !mailFromAddress.equals("YOUR_GMAIL_ADDRESS@gmail.com");
+
+        if (!mailConfigured) {
             System.out.println("=========================================");
-            System.out.println("[ShipTrackPro] Email delivery failed: " + e.getMessage());
-            System.out.println("Email : " + toEmail);
-            System.out.println("OTP   : " + otp);
+            System.out.println("[ShipTrackPro] Mail not configured — console fallback.");
+            System.out.println("Caller : DELIVERY");
+            System.out.println("Email  : " + toEmail);
+            System.out.println("OTP    : " + otp);
             System.out.println("=========================================");
+            return;
+        }
+
+        try {
+            MimeMessage message = mailSender.createMimeMessage();
+            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
+            helper.setFrom(mailFromAddress, "Shipment Tracker Pro");
+            helper.setTo(toEmail);
+            helper.setSubject("Shipment Tracker Pro — Your Delivery Verification Code");
+            helper.setText(buildDeliveryOtpEmailTemplate(otp), true);
+            mailSender.send(message);
+            System.out.println("[ShipTrackPro] Delivery OTP email dispatched to: " + maskEmail(toEmail));
+        } catch (Exception e) {
+            System.out.println("[ShipTrackPro] Delivery OTP email failed for " +
+                    maskEmail(toEmail) + ": " + e.getMessage());
         }
     }
 
@@ -472,12 +719,12 @@ public class AuthServiceImpl implements AuthService {
                // Body
                "      <tr><td style='padding:40px 40px 32px;'>" +
                "        <h1 style='margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;'>Verify Your Email Address</h1>" +
-               "        <p style='margin:0 0 32px;font-size:14px;color:#64748b;line-height:1.6;'>Use the code below to complete your Shipment Tracker Pro registration. This code expires in <strong>5 minutes</strong>.</p>" +
+               "        <p style='margin:0 0 32px;font-size:14px;color:#64748b;line-height:1.6;'>Use the code below to complete your Shipment Tracker Pro registration. This code expires in <strong>2 minutes</strong>.</p>" +
                // OTP Box
                "        <div style='background:#f8fafc;border:2px dashed #e2e8f0;border-radius:12px;padding:28px;text-align:center;margin-bottom:28px;'>" +
                "          <p style='margin:0 0 8px;font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;'>Your Verification Code</p>" +
                "          <div style='font-size:42px;font-weight:800;letter-spacing:0.25em;color:#4f46e5;font-family:monospace;'>" + otp + "</div>" +
-               "          <p style='margin:12px 0 0;font-size:12px;color:#94a3b8;'>Expires in 5 minutes</p>" +
+               "          <p style='margin:12px 0 0;font-size:12px;color:#94a3b8;'>Expires in 2 minutes</p>" +
                "        </div>" +
                // Security notice
                "        <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:16px;margin-bottom:28px;'>" +
@@ -488,7 +735,104 @@ public class AuthServiceImpl implements AuthService {
                "      </td></tr>" +
                // Footer
                "      <tr><td style='background:#f8fafc;border-top:1px solid #e2e8f0;padding:24px 40px;text-align:center;'>" +
-               "        <p style='margin:0;font-size:12px;color:#94a3b8;'>© 2025 Shipment Tracker Pro · Enterprise Logistics Platform</p>" +
+               "        <p style='margin:0;font-size:12px;color:#94a3b8;'>© 2026 Shipment Tracker Pro · Enterprise Logistics Platform</p>" +
+               "        <p style='margin:4px 0 0;font-size:12px;color:#94a3b8;'>This is an automated message — please do not reply.</p>" +
+               "      </td></tr>" +
+               "    </table>" +
+               "  </td></tr>" +
+               "</table>" +
+               "</body></html>";
+    }
+    private String buildForgotPasswordEmailTemplate(String otp) {
+
+        return "<!DOCTYPE html>" +
+               "<html lang='en'>" +
+               "<head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head>" +
+               "<body style='margin:0;padding:0;background:#f1f5f9;font-family:Inter,Segoe UI,Arial,sans-serif;'>" +
+               "<table width='100%' cellpadding='0' cellspacing='0' style='background:#f1f5f9;padding:40px 0;'>" +
+               "  <tr><td align='center'>" +
+               "    <table width='560' cellpadding='0' cellspacing='0' style='background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);'>" +
+               // Header
+               "      <tr><td style='background:linear-gradient(135deg,#4f46e5 0%,#3730a3 100%);padding:36px 40px;text-align:center;'>" +
+               "        <div style='display:inline-flex;align-items:center;gap:10px;'>" +
+               "          <div style='width:40px;height:40px;background:rgba(255,255,255,0.2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;'>📦</div>" +
+               "          <span style='color:#ffffff;font-size:20px;font-weight:800;letter-spacing:-0.02em;'>Shipment Tracker Pro</span>" +
+               "        </div>" +
+               "        <p style='color:rgba(255,255,255,0.75);margin:8px 0 0;font-size:13px;'>Enterprise Logistics Platform</p>" +
+               "      </td></tr>" +
+               // Body
+               "      <tr><td style='padding:40px 40px 32px;'>" +
+               "        <h1 style='margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;'>Reset Your Password</h1>" +
+               "        <p style='margin:0 0 32px;font-size:14px;color:#64748b;line-height:1.6;'>Use the code below to reset your password. This code expires in <strong>120 seconds</strong>.</p>" +
+               // OTP Box
+               "        <div style='background:#f8fafc;border:2px dashed #e2e8f0;border-radius:12px;padding:28px;text-align:center;margin-bottom:28px;'>" +
+               "          <p style='margin:0 0 8px;font-size:12px;font-weight:700;color:#64748b;text-transform:uppercase;letter-spacing:0.1em;'>Password Reset Code</p>" +
+               "          <div style='font-size:42px;font-weight:800;letter-spacing:0.25em;color:#4f46e5;font-family:monospace;'>" + otp + "</div>" +
+               "          <p style='margin:12px 0 0;font-size:12px;color:#94a3b8;'>Password reset code expires in 120 seconds</p>" +
+               "        </div>" +
+               // Security notice
+               "        <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:16px;margin-bottom:28px;'>" +
+               "          <p style='margin:0;font-size:13px;color:#991b1b;font-weight:600;'>⚠️ Password Reset Security</p>" +
+               "          <p style='margin:6px 0 0;font-size:13px;color:#b91c1c;line-height:1.5;'>If you did not request a password reset, ignore this email immediately. Never share this password reset code with anyone. Shipment Tracker Pro will never ask for this code via phone, email, or chat.</p>" +
+               "        </div>" +
+               "        <p style='font-size:13px;color:#64748b;line-height:1.6;'>If you did not request to reset your password, no further action is required. Your account remains secure, and you can safely ignore this email.</p>" +
+               "      </td></tr>" +
+               // Footer
+               "      <tr><td style='background:#f8fafc;border-top:1px solid #e2e8f0;padding:24px 40px;text-align:center;'>" +
+               "        <p style='margin:0;font-size:12px;color:#94a3b8;'>© 2026 Shipment Tracker Pro · Enterprise Logistics Platform</p>" +
+               "        <p style='margin:4px 0 0;font-size:12px;color:#94a3b8;'>This is an automated message — please do not reply.</p>" +
+               "      </td></tr>" +
+               "    </table>" +
+               "  </td></tr>" +
+               "</table>" +
+               "</body></html>";
+    }
+
+    /** Builds the dedicated HTML email template for delivery OTP verification.
+     *  Uses a green-themed header to visually distinguish it from the
+     *  Registration (blue) and Forgot-Password (blue) templates.
+     */
+    private String buildDeliveryOtpEmailTemplate(String otp) {
+        return "<!DOCTYPE html>" +
+               "<html lang='en'>" +
+               "<head><meta charset='UTF-8'><meta name='viewport' content='width=device-width, initial-scale=1.0'></head>" +
+               "<body style='margin:0;padding:0;background:#f0fdf4;font-family:Inter,Segoe UI,Arial,sans-serif;'>" +
+               "<table width='100%' cellpadding='0' cellspacing='0' style='background:#f0fdf4;padding:40px 0;'>" +
+               "  <tr><td align='center'>" +
+               "    <table width='560' cellpadding='0' cellspacing='0' style='background:#ffffff;border-radius:16px;overflow:hidden;box-shadow:0 4px 24px rgba(15,23,42,0.08);'>" +
+               // Header — green gradient
+               "      <tr><td style='background:linear-gradient(135deg,#059669 0%,#047857 100%);padding:36px 40px;text-align:center;'>" +
+               "        <div style='display:inline-flex;align-items:center;gap:10px;'>" +
+               "          <div style='width:40px;height:40px;background:rgba(255,255,255,0.2);border-radius:10px;display:flex;align-items:center;justify-content:center;font-size:20px;'>🚚</div>" +
+               "          <span style='color:#ffffff;font-size:20px;font-weight:800;letter-spacing:-0.02em;'>Shipment Tracker Pro</span>" +
+               "        </div>" +
+               "        <p style='color:rgba(255,255,255,0.80);margin:8px 0 0;font-size:13px;'>Delivery Verification</p>" +
+               "      </td></tr>" +
+               // Body
+               "      <tr><td style='padding:40px 40px 32px;'>" +
+               "        <h1 style='margin:0 0 8px;font-size:24px;font-weight:700;color:#0f172a;'>Your Delivery is Here!</h1>" +
+               "        <p style='margin:0 0 32px;font-size:14px;color:#64748b;line-height:1.6;'>A Shipment Tracker Pro driver is at your door and needs to verify your identity before completing the delivery. Please share the code below <strong>only with the driver present in front of you</strong>. This code expires in <strong>120 seconds</strong>.</p>" +
+               // OTP Box — green accent
+               "        <div style='background:#f0fdf4;border:2px dashed #6ee7b7;border-radius:12px;padding:28px;text-align:center;margin-bottom:28px;'>" +
+               "          <p style='margin:0 0 8px;font-size:12px;font-weight:700;color:#065f46;text-transform:uppercase;letter-spacing:0.1em;'>Delivery Verification Code</p>" +
+               "          <div style='font-size:42px;font-weight:800;letter-spacing:0.25em;color:#059669;font-family:monospace;'>" + otp + "</div>" +
+               "          <p style='margin:12px 0 0;font-size:12px;color:#94a3b8;'>⏱ Expires in 120 seconds — act quickly</p>" +
+               "        </div>" +
+               // Info notice
+               "        <div style='background:#ecfdf5;border:1px solid #6ee7b7;border-radius:8px;padding:16px;margin-bottom:28px;'>" +
+               "          <p style='margin:0;font-size:13px;color:#065f46;font-weight:600;'>✅ What to do</p>" +
+               "          <p style='margin:6px 0 0;font-size:13px;color:#047857;line-height:1.5;'>Read this code aloud to the driver. They will enter it into the delivery app to confirm you are the registered recipient before handing over your package.</p>" +
+               "        </div>" +
+               // Security notice
+               "        <div style='background:#fef2f2;border:1px solid #fecaca;border-radius:8px;padding:16px;margin-bottom:28px;'>" +
+               "          <p style='margin:0;font-size:13px;color:#991b1b;font-weight:600;'>⚠️ Safety Reminder</p>" +
+               "          <p style='margin:6px 0 0;font-size:13px;color:#b91c1c;line-height:1.5;'>Only share this code with a Shipment Tracker Pro delivery driver who is physically at your location. Never share it via phone call, message, or email.</p>" +
+               "        </div>" +
+               "        <p style='font-size:13px;color:#64748b;line-height:1.6;'>If you were not expecting a delivery or did not request this code, please do not share it and contact our support team.</p>" +
+               "      </td></tr>" +
+               // Footer
+               "      <tr><td style='background:#f8fafc;border-top:1px solid #e2e8f0;padding:24px 40px;text-align:center;'>" +
+               "        <p style='margin:0;font-size:12px;color:#94a3b8;'>© 2026 Shipment Tracker Pro · Enterprise Logistics Platform</p>" +
                "        <p style='margin:4px 0 0;font-size:12px;color:#94a3b8;'>This is an automated message — please do not reply.</p>" +
                "      </td></tr>" +
                "    </table>" +

@@ -150,6 +150,16 @@ export function ShipmentProvider({ children }) {
         senderPhone: formData.senderPhone,
         receiverName: formData.receiverName,
         receiverPhone: formData.receiverPhone,
+        // Link the selected registered customer so Shipment.receiverUser is persisted.
+        // When non-null, the backend's resolveOptionalUser() loads the User entity and
+        // stores it on the shipment, enabling the Delivery OTP system to retrieve
+        // shipment.getReceiverUser().getEmail() at delivery time without null errors.
+        receiverUserId: formData.receiverUserId || null,
+        // Route receiverEmail to guestEmail based on whether a registered customer was selected.
+        // Registered customer (receiverUserId set): guestEmail = null — backend uses receiverUser.email.
+        // Guest customer (receiverUserId null):     guestEmail = receiverEmail — stored on shipment
+        //                                           and used by Delivery OTP as the email destination.
+        guestEmail: formData.receiverUserId ? null : (formData.receiverEmail || null),
         originAddress: {
           line1: formData.senderAddress || formData.senderCity,
           city: formData.senderCity,

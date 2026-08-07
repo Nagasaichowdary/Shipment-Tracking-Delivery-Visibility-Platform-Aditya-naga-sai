@@ -5,6 +5,7 @@ import { AuthContext } from "../../context/auth";
 // Roles that are allowed to create shipments.
 // Customer is intentionally excluded.
 const CREATE_SHIPMENT_ROLES = ["Logistics Operator", "Administrator", "Business Client", "Support Agent"];
+const ANALYTICS_ROLES       = ["Administrator", "Logistics Operator"];
 
 const navigation = [
   { to: "/dashboard", label: "Dashboard", icon: "D" },
@@ -22,6 +23,7 @@ const adminNavigation = [
 
 const driverNavigation = [
   { to: "/driver/deliveries", label: "Available Deliveries", icon: "📦" },
+  { to: "/driver/history",   label: "Delivery History",     icon: "🏁" },
 ];
 
 function Sidebar() {
@@ -51,6 +53,22 @@ function Sidebar() {
             </NavLink>
           ))}
       </nav>
+
+      {(ANALYTICS_ROLES.includes(auth?.user?.role)) && (
+        <>
+          <div className="nav-section-label" style={{ marginTop: 24 }}>Analytics</div>
+          <nav>
+            <NavLink className="nav-link" to="/analytics" end>
+              <span className="nav-icon">📊</span>
+              <span>Analytics</span>
+            </NavLink>
+            <NavLink className="nav-link" to="/reports" end>
+              <span className="nav-icon">📋</span>
+              <span>Reports</span>
+            </NavLink>
+          </nav>
+        </>
+      )}
 
       {auth?.user?.role === "Administrator" && (
         <>

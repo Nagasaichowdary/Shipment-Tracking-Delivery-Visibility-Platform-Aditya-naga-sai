@@ -32,6 +32,8 @@ public class ShipmentResponse {
     private String receiverName;
     private String receiverPhone;
     private Long receiverUserId;
+    /** Email for a guest (non-registered) receiver. Null when receiverUserId is set. */
+    private String guestEmail;
 
     private AddressResponse originAddress;
     private AddressResponse destinationAddress;
@@ -64,6 +66,32 @@ public class ShipmentResponse {
      * {@code null} for every status other than DELAYED.
      */
     private String delayReason;
+
+    // ── Milestone 3: Delivery Confirmation + Proof of Delivery ─────────────────
+
+    /** Whether the delivery has been formally confirmed by the driver. */
+    private Boolean deliveryConfirmed;
+
+    /** Server-side UTC timestamp of the confirmed delivery. */
+    private LocalDateTime deliveredAt;
+
+    /** Name of the person who physically received the package. */
+    private String deliveryReceiverName;
+
+    /** Optional driver remarks recorded at delivery time. */
+    private String deliveryRemarks;
+
+    /**
+     * Relative server path to the customer's drawn signature PNG.
+     * Example: {@code delivery/SHIP-ABCD1234/signature.png}
+     */
+    private String customerSignaturePath;
+
+    /**
+     * Relative server path to the delivery photo.
+     * Example: {@code delivery/SHIP-ABCD1234/delivery-photo.jpg}
+     */
+    private String deliveryPhotoPath;
 
     private LocalDateTime createdAt;
     private LocalDateTime updatedAt;
