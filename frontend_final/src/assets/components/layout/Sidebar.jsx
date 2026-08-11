@@ -98,6 +98,23 @@ function Sidebar() {
         </>
       )}
 
+      {auth?.user?.role === "Business Client" && (
+        <>
+          <div className="nav-section-label" style={{ marginTop: 24 }}>My Workspace</div>
+          <nav>
+            <NavLink className="nav-link" to="/my-analytics" end>
+              <span className="nav-icon">📊</span>
+              <span>My Analytics</span>
+            </NavLink>
+            <NavLink className="nav-link" to="/my-reports" end>
+              <span className="nav-icon">📄</span>
+              <span>My Reports</span>
+            </NavLink>
+          </nav>
+        </>
+      )}
+
+
       <div className="nav-section-label">Session</div>
       <div style={{ padding: "0 8px", color: "#dce7f3", fontSize: 14 }}>
         <strong>{auth.user.name}</strong>

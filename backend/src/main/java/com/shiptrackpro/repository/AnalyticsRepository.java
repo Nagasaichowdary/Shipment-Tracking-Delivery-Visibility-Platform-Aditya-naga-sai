@@ -387,4 +387,44 @@ public interface AnalyticsRepository extends JpaRepository<Shipment, Long> {
     List<Shipment> findByCreatedByAndDateRange(@Param("userId") Long userId,
                                                @Param("from") LocalDateTime from,
                                                @Param("to") LocalDateTime to);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Business Client personal analytics — user-scoped variants
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Monthly shipment creation trend for a single user.
+     * Mirrors {@link #monthlyShipmentTrend(LocalDateTime)} but restricted
+     * to shipments whose {@code created_by} matches {@code userId}.
+     *
+     * <p><b>Native SQL</b> — uses PostgreSQL {@code EXTRACT()} which
+     * Hibernate 6 JPQL validation rejects at startup.
+     *
+     * <p>Result rows: [year (Number), month (Number), count (Number)]
+     */
+    @Query(value = "SELECT EXTRACT(YEAR  FROM created_at) AS yr, " +
+                   "       EXTRACT(MONTH FROM created_at) AS mo, " +
+                   "       COUNT(*)                        AS cnt " +
+                   "FROM shipments " +
+                   "WHERE created_by = :userId AND created_at >= :since " +
+                   "GROUP BY EXTRACT(YEAR FROM created_at), " +
+                   "         EXTRACT(MONTH FROM created_at) " +
+                   "ORDER BY yr, mo",
+           nativeQuery = true)
+    List<Object[]> monthlyShipmentTrendForUser(@Param("userId") Long userId,
+                                               @Param("since") LocalDateTime since);
+
+    /**
+     * Top destination cities for shipments created by a specific user.
+     * Mirrors {@link #topDestinationCities(Pageable)} but restricted
+     * to one user's shipments.
+     *
+     * <p>Result rows: [city (String), count (Long)]
+     */
+    @Query("SELECT a.city, COUNT(s) " +
+           "FROM Shipment s JOIN s.destinationAddress a " +
+           "WHERE s.createdBy.userId = :userId " +
+           "GROUP BY a.city " +
+           "ORDER BY COUNT(s) DESC")
+    List<Object[]> topDestinationCitiesForUser(@Param("userId") Long userId, Pageable pageable);
 }

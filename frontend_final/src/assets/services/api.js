@@ -227,4 +227,41 @@ export const exportReport = (reportType, format, period = "month", from = null, 
     responseType: "blob",
   });
 
-export default API;
+// ─── Business Client: My Analytics & My Reports ───────────────────────────────
+// All /api/my/* endpoints are secured by ROLE_BUSINESS_CLIENT JWT on the backend.
+// The userId is NEVER sent from the frontend — the backend extracts it from the JWT.
+
+/**
+ * Returns analytics KPIs and chart data for the logged-in Business Client.
+ * GET /api/my/analytics?period=all
+ */
+export const getMyAnalytics = (period = "all", from = null, to = null) =>
+  API.get("/my/analytics", {
+    params: { period, ...(from && { from }), ...(to && { to }) },
+  });
+
+/**
+ * Returns paginated shipment report for the logged-in Business Client.
+ * GET /api/my/reports?period=all&status=&page=0&size=20
+ */
+export const getMyReport = (params = {}) =>
+  API.get("/my/reports", { params });
+
+/**
+ * Exports the Business Client's own shipments as PDF, Excel, or CSV.
+ * GET /api/my/reports/export?format=pdf&period=all
+ * Returns a Blob for client-side download.
+ */
+export const exportMyReport = (format = "csv", period = "all", from = null, to = null, status = null) =>
+  API.get("/my/reports/export", {
+    params: {
+      format,
+      period,
+      ...(from && { from }),
+      ...(to && { to }),
+      ...(status && { status }),
+    },
+    responseType: "blob",
+  });
+
+export default API;

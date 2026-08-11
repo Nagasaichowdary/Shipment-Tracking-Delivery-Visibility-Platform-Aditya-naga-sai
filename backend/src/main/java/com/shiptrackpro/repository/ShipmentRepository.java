@@ -88,4 +88,32 @@ public interface ShipmentRepository extends JpaRepository<Shipment, Long> {
             @Param("from") java.time.LocalDateTime from,
             @Param("to") java.time.LocalDateTime to,
             org.springframework.data.domain.Pageable page);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Business Client personal reports — user-scoped paginated query
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Paginated shipments for a single Business Client, with optional status filter.
+     * Used by GET /api/my/reports — the userId is extracted from the JWT server-side
+     * and is never accepted from the client request.
+     *
+     * @param userId the authenticated Business Client's user ID
+     * @param status optional status filter — pass {@code null} for all statuses
+     * @param from   inclusive lower bound on {@code created_at}
+     * @param to     exclusive upper bound on {@code created_at}
+     * @param page   Spring Data {@link org.springframework.data.domain.Pageable}
+     */
+    @Query("SELECT s FROM Shipment s " +
+           "WHERE s.createdBy.userId = :userId " +
+           "AND (:status IS NULL OR s.shipmentStatus = :status) " +
+           "AND s.createdAt >= :from AND s.createdAt <= :to " +
+           "ORDER BY s.createdAt DESC")
+    org.springframework.data.domain.Page<Shipment> findByCreatedByUserIdAndDateRangeAndStatus(
+            @Param("userId") Long userId,
+            @Param("status") ShipmentStatus status,
+            @Param("from") java.time.LocalDateTime from,
+            @Param("to") java.time.LocalDateTime to,
+            org.springframework.data.domain.Pageable page);
 }
+

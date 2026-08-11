@@ -23,6 +23,8 @@ import DeliveryHistory from "./assets/pages/DeliveryHistory";
 import AnalyticsDashboard from "./assets/pages/AnalyticsDashboard";
 import RouteHistory from "./assets/pages/RouteHistory";
 import DeliveryReports from "./assets/pages/DeliveryReports";
+import MyAnalytics from "./assets/pages/MyAnalytics";
+import MyReports from "./assets/pages/MyReports";
 
 function ProtectedRoute({ children }) {
   const { isAuthenticated } = useContext(AuthContext);
@@ -108,6 +110,23 @@ function AppLayout() {
                 element={
                   <RoleProtectedRoute allowedRoles={["Driver"]}>
                     <DeliveryHistory />
+                  </RoleProtectedRoute>
+                }
+              />
+              {/* ── Business Client personal pages ── */}
+              <Route
+                path="/my-analytics"
+                element={
+                  <RoleProtectedRoute allowedRoles={["Business Client"]}>
+                    <MyAnalytics />
+                  </RoleProtectedRoute>
+                }
+              />
+              <Route
+                path="/my-reports"
+                element={
+                  <RoleProtectedRoute allowedRoles={["Business Client"]}>
+                    <MyReports />
                   </RoleProtectedRoute>
                 }
               />
