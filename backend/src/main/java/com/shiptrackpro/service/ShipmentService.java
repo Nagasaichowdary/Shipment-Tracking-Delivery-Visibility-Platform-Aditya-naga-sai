@@ -36,6 +36,41 @@ public interface ShipmentService {
     List<ShipmentResponse> getAllShipments();
 
     /**
+     * Retrieves shipments that belong to the authenticated Customer or Business Client.
+     *
+     * <p>A shipment is considered to belong to a user when that user appears as
+     * either the <em>receiver</em> ({@code receiver_user_id}) or the
+     * <em>sender</em> ({@code sender_user_id}) on the shipment record.
+     * This covers both cases:
+     * <ul>
+     *   <li>Admin/Logistics Operator creates a shipment <em>for</em> a Customer
+     *       (Customer is set as the receiver via {@code receiverUserId} in the form).</li>
+     *   <li>A role with create-shipment permission creates one as the sender.</li>
+     * </ul>
+     *
+     * <p>The {@code userId} is extracted from the Spring Security JWT principal
+     * by the controller — it is never accepted from the HTTP request.
+     *
+     * @param userId the authenticated user's ID (from JWT)
+     * @return list of shipments associated with that user, never null
+     */
+    List<ShipmentResponse> getMyShipments(Long userId);
+
+    /**
+     * Returns a shipment by tracking number only if the authenticated user
+     * (Customer or Business Client) is the sender or receiver.
+     *
+     * <p>Returns {@code null} when the shipment exists but does not belong to
+     * the caller — callers must treat this the same as not-found to avoid
+     * leaking the existence of other users' shipments.
+     *
+     * @param trackingNumber the human-readable tracking number
+     * @param userId         the authenticated user's ID (from JWT)
+     * @return the shipment if found and owned, or {@code null}
+     */
+    ShipmentResponse getShipmentByTrackingNumberForUser(String trackingNumber, Long userId);
+
+    /**
      * Retrieves a single shipment by its primary key.
      *
      * @throws com.shiptrackpro.exception.ResourceNotFoundException if no shipment exists with the given id

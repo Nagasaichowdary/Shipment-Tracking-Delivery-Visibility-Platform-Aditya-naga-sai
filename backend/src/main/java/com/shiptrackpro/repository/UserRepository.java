@@ -11,6 +11,23 @@ public interface UserRepository extends JpaRepository<User, Long> {
 
     Optional<User> findByEmail(String email);
 
+    /**
+     * Case-insensitive email lookup.
+     *
+     * <p>Used during shipment creation to auto-associate a shipment with a
+     * registered Customer when the Admin/Logistics Operator manually enters
+     * a receiver email that matches an existing Customer account, without
+     * having explicitly selected that Customer from the dropdown.</p>
+     *
+     * <p>Spring Data JPA translates {@code IgnoreCase} into a
+     * {@code LOWER(email) = LOWER(:email)} predicate, so mixed-case entries
+     * such as "Customer@Gmail.com" correctly match "customer@gmail.com".</p>
+     *
+     * @param email the receiver email entered on the Create Shipment form
+     * @return the matching User, or empty if no account has that email
+     */
+    Optional<User> findByEmailIgnoreCase(String email);
+
     boolean existsByEmail(String email);
 
     boolean existsByPhone(String phone);

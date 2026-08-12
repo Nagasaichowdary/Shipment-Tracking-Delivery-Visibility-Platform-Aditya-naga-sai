@@ -78,15 +78,47 @@ public class ShipmentServiceImpl implements ShipmentService {
     public ShipmentResponse createShipment(CreateShipmentRequest request, Long createdByUserId) {
         User createdBy = findUserOrThrow(createdByUserId, "creator");
 
-        // Determine guest email:
-        //   - Registered customer path (receiverUserId set): guestEmail must be null —
-        //     the registered customer's email is always fetched from their User entity
-        //     by the Delivery OTP system at delivery time.
-        //   - Guest customer path (receiverUserId null): guestEmail is required so the
-        //     Delivery OTP system has an email address to send the verification code to.
+        // ── Resolve receiver (PRIORITY ORDER) ──────────────────────────────
+        //
+        // Priority 1: Registered Customer explicitly selected from the dropdown.
+        //   • receiverUserId is non-null.
+        //   • Load that User directly by ID — same as before; nothing changes.
+        //   • guestEmail is ignored (null is stored) because receiverUser.email
+        //     is used by the Delivery OTP system at delivery time.
+        //
+        // Priority 2: No Registered Customer selected (receiverUserId == null).
+        //   • guestEmail (the manually entered Receiver Email) is required.
+        //   • Attempt a case-insensitive lookup by that email to see if it
+        //     belongs to an APPROVED CUSTOMER account on the platform.
+        //
+        //   2a. Email matches a registered CUSTOMER:
+        //       • Set receiverUser to that Customer (auto-association).
+        //       • Clear guestEmail to null — consistent with the registered-
+        //         customer path so the Delivery OTP system uses receiverUser.email.
+        //       • The Customer will now see this shipment via GET /api/shipments/my.
+        //
+        //   2b. Email does not match any registered Customer (unknown / guest):
+        //       • Leave receiverUser null (no FK link).
+        //       • Keep guestEmail so the Delivery OTP system has a contact address.
+        //       • Shipment creation proceeds normally without any error.
+        //
+        // Security: the auto-association is performed server-side using the
+        // email value from CreateShipmentRequest.guestEmail — the frontend
+        // never supplies a userId for this path, preventing spoofing.
+        // ───────────────────────────────────────────────────────────────────
+
         boolean hasRegisteredReceiver = request.getReceiverUserId() != null;
-        String resolvedGuestEmail = null;
-        if (!hasRegisteredReceiver) {
+        User    resolvedReceiverUser  = null;
+        String  resolvedGuestEmail    = null;
+
+        if (hasRegisteredReceiver) {
+            // ── Case 1: Registered Customer explicitly selected ──────────────
+            // Load by ID exactly as before. guestEmail stays null.
+            resolvedReceiverUser = resolveOptionalUser(request.getReceiverUserId());
+
+        } else {
+            // ── Case 2: No Registered Customer selected ──────────────────────
+            // guestEmail is required — reject creation if missing.
             String rawGuest = request.getGuestEmail();
             if (rawGuest == null || rawGuest.isBlank()) {
                 throw new IllegalArgumentException(
@@ -94,6 +126,32 @@ public class ShipmentServiceImpl implements ShipmentService {
                         "Please provide a valid email address or select a registered customer.");
             }
             resolvedGuestEmail = rawGuest.trim().toLowerCase();
+
+            // Auto-association: check whether the entered email belongs to
+            // an existing APPROVED CUSTOMER account.
+            // • findByEmailIgnoreCase — case-insensitive; handles "CUSTOMER@Gmail.com"
+            //   matching "customer@gmail.com" stored in the DB.
+            // • We then verify role == CUSTOMER and status == APPROVED before
+            //   linking — a DRIVER or ADMIN email must NOT trigger auto-association.
+            // • If no match, resolvedReceiverUser stays null → guest path proceeds.
+            User emailMatchedUser = userRepository
+                    .findByEmailIgnoreCase(resolvedGuestEmail)
+                    .orElse(null);
+
+            if (emailMatchedUser != null
+                    && emailMatchedUser.getRole() != null
+                    && "CUSTOMER".equals(emailMatchedUser.getRole().getRoleName())
+                    && com.shiptrackpro.entity.RegistrationStatus.APPROVED
+                            .equals(emailMatchedUser.getRegistrationStatus())) {
+
+                // Email belongs to a registered, approved Customer.
+                // Auto-associate and clear guestEmail (receiverUser.email is used
+                // by Delivery OTP — storing both would be redundant and confusing).
+                resolvedReceiverUser = emailMatchedUser;
+                resolvedGuestEmail   = null;
+            }
+            // else: unknown / non-customer email → leave receiverUser null,
+            //       keep resolvedGuestEmail for the Delivery OTP system.
         }
 
         Shipment shipment = Shipment.builder()
@@ -103,7 +161,7 @@ public class ShipmentServiceImpl implements ShipmentService {
                 .senderUser(resolveOptionalUser(request.getSenderUserId()))
                 .receiverName(request.getReceiverName())
                 .receiverPhone(request.getReceiverPhone())
-                .receiverUser(resolveOptionalUser(request.getReceiverUserId()))
+                .receiverUser(resolvedReceiverUser)
                 .guestEmail(resolvedGuestEmail)
                 .originAddress(toAddressEntity(request.getOriginAddress()))
                 .destinationAddress(toAddressEntity(request.getDestinationAddress()))
@@ -114,7 +172,6 @@ public class ShipmentServiceImpl implements ShipmentService {
                 .expectedDeliveryDate(request.getExpectedDeliveryDate())
                 .createdBy(createdBy)
                 .build();
-
 
         // originAddress/destinationAddress are transient at this point;
         // cascade = {PERSIST, MERGE} on Shipment's associations (see the
@@ -142,6 +199,42 @@ public class ShipmentServiceImpl implements ShipmentService {
                 .stream()
                 .map(this::mapToResponse)
                 .toList();
+    }
+
+    /**
+     * Returns only the shipments associated with the authenticated user
+     * (those where they are either the receiver or sender).
+     *
+     * <p>This is the correct isolation query for the CUSTOMER and
+     * BUSINESS_CLIENT roles. A new customer with no associated shipments
+     * will receive an empty list — never another user's data.
+     *
+     * <p>The userId is extracted from the JWT by the controller and passed
+     * here — it is never accepted from the HTTP request parameters.
+     */
+    @Override
+    @Transactional(readOnly = true)
+    public List<ShipmentResponse> getMyShipments(Long userId) {
+        return shipmentRepository.findByReceiverOrSender(userId)
+                .stream()
+                .map(this::mapToResponse)
+                .toList();
+    }
+
+    /**
+     * Ownership-checked tracking lookup for Customer/Business Client.
+     * Returns the shipment only when the tracking number matches AND
+     * the given user is the receiver or sender.
+     * Returns null (treated as not-found by the controller) when the
+     * shipment belongs to a different user.
+     */
+    @Override
+    @Transactional(readOnly = true)
+    public ShipmentResponse getShipmentByTrackingNumberForUser(String trackingNumber, Long userId) {
+        return shipmentRepository
+                .findByTrackingNumberAndUser(trackingNumber, userId)
+                .map(this::mapToResponse)
+                .orElse(null);
     }
 
     @Override

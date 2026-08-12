@@ -115,5 +115,51 @@ public interface ShipmentRepository extends JpaRepository<Shipment, Long> {
             @Param("from") java.time.LocalDateTime from,
             @Param("to") java.time.LocalDateTime to,
             org.springframework.data.domain.Pageable page);
+
+    // ─────────────────────────────────────────────────────────────────────────
+    // Customer / Business Client personal shipment queries
+    // ─────────────────────────────────────────────────────────────────────────
+
+    /**
+     * Returns all shipments where the given user is either the registered
+     * receiver ({@code receiver_user_id}) or the registered sender
+     * ({@code sender_user_id}).
+     *
+     * <p>This is the correct ownership query for Customers: an Admin or
+     * Logistics Operator creates a shipment and selects the Customer as the
+     * receiver via {@code receiverUserId}. The Customer should then see that
+     * shipment in their "My Shipments" list.</p>
+     *
+     * <p>Ordered newest-first so the UI shows the most recent shipments at
+     * the top without any additional sorting.</p>
+     *
+     * @param userId the authenticated Customer's user ID (from JWT — never from the request)
+     * @return list of shipments associated with the user as sender or receiver
+     */
+    @Query("SELECT s FROM Shipment s " +
+           "WHERE s.receiverUser.userId = :userId " +
+           "OR s.senderUser.userId = :userId " +
+           "ORDER BY s.createdAt DESC")
+    List<Shipment> findByReceiverOrSender(@Param("userId") Long userId);
+
+    /**
+     * Ownership-checked tracking number lookup.
+     *
+     * <p>Returns the shipment only when the tracking number matches AND
+     * the given user is the receiver or sender. Returns an empty Optional
+     * when the shipment exists but belongs to a different user — the caller
+     * must treat this identically to "not found" to prevent leaking the
+     * existence of other users' shipments.</p>
+     *
+     * @param trackingNumber the shipment's tracking number
+     * @param userId         the authenticated user's ID (from JWT)
+     */
+    @Query("SELECT s FROM Shipment s " +
+           "WHERE s.trackingNumber = :trackingNumber " +
+           "AND (s.receiverUser.userId = :userId OR s.senderUser.userId = :userId)")
+    java.util.Optional<Shipment> findByTrackingNumberAndUser(
+            @Param("trackingNumber") String trackingNumber,
+            @Param("userId") Long userId);
 }
+
 

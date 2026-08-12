@@ -79,9 +79,35 @@ public class ShipmentController {
         return ResponseEntity.status(HttpStatus.CREATED).body(response);
     }
 
+    /**
+     * Returns ALL shipments.
+     * Restricted to ADMIN and LOGISTICS OPERATOR (DISPATCHER) roles only.
+     * Customers must use GET /api/shipments/my instead.
+     */
+    @PreAuthorize("hasAnyRole('ADMIN', 'DISPATCHER')")
     @GetMapping
     public ResponseEntity<List<ShipmentResponse>> getAllShipments() {
         return ResponseEntity.ok(shipmentService.getAllShipments());
+    }
+
+    /**
+     * Returns the shipments belonging to the authenticated Customer or Business Client.
+     *
+     * <p>The caller's identity is extracted from the JWT via
+     * {@code @AuthenticationPrincipal} — a userId is never accepted from the
+     * request to prevent customers from accessing other customers' data.</p>
+     *
+     * <p>A new customer with no associated shipments receives an empty list.
+     * This endpoint returns data only for shipments where the authenticated
+     * user is the registered receiver or sender.</p>
+     *
+     * <pre>GET /api/shipments/my</pre>
+     */
+    @PreAuthorize("hasAnyRole('CUSTOMER', 'BUSINESS_CLIENT')")
+    @GetMapping("/my")
+    public ResponseEntity<List<ShipmentResponse>> getMyShipments(
+            @AuthenticationPrincipal User currentUser) {
+        return ResponseEntity.ok(shipmentService.getMyShipments(currentUser.getUserId()));
     }
 
     @GetMapping("/{id}")

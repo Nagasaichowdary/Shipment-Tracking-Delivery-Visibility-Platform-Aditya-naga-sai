@@ -40,7 +40,15 @@ export const approveUser = (id) => API.put(`/admin/approve/${id}`);
 export const rejectUser = (id) => API.put(`/admin/reject/${id}`);
 
 // Shipments
+/** Admin / Logistics Operator: returns ALL shipments in the system */
 export const getAllShipments = () => API.get("/shipments");
+
+/**
+ * Customer / Business Client: returns ONLY shipments belonging to the
+ * authenticated user (those where they are the registered receiver or sender).
+ * The userId is derived from the JWT on the backend — never passed as a param.
+ */
+export const getCustomerShipments = () => API.get("/shipments/my");
 
 export const getShipmentById = (id) => API.get(`/shipments/${id}`);
 

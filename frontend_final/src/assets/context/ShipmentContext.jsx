@@ -2,6 +2,7 @@ import { useCallback, useEffect, useMemo, useState } from "react";
 import { ShipmentContext } from "./shipments";
 import {
   getAllShipments,
+  getCustomerShipments,
   createShipment as apiCreateShipment,
   updateShipmentStatus as apiUpdateStatus,
 } from "../services/api";
@@ -113,13 +114,26 @@ export function ShipmentProvider({ children }) {
   const [error, setError] = useState("");
 
   // -----------------------------------------------------------------
-  // Fetch all shipments from the backend on mount
+  // Fetch shipments from the backend on mount.
+  // CUSTOMER and BUSINESS_CLIENT roles call GET /api/shipments/my
+  // which is scoped to the authenticated user's own shipments.
+  // All other roles (ADMIN, DISPATCHER, DRIVER) call GET /api/shipments.
+  // The backend enforces this with @PreAuthorize on each endpoint —
+  // this role check is an additional layer, not the primary guard.
   // -----------------------------------------------------------------
   const fetchShipments = useCallback(async () => {
     setLoading(true);
     try {
-      const response = await getAllShipments();
-      const data = Array.isArray(response.data) ? response.data : [];
+      // Read role from sessionStorage — the same store AuthContext.jsx uses.
+      // AuthContext persists the raw backend role name under the key "role"
+      // (e.g. "CUSTOMER", "ADMIN", "DISPATCHER"). We do a simple case-insensitive
+      // check rather than calling mapRole() to avoid importing a dependency.
+      // Note: localStorage was WRONG — the auth system uses sessionStorage.
+      const rawRole    = sessionStorage.getItem("role") || "";
+      const upperRole  = rawRole.toUpperCase().replace(/\s+/g, "_");
+      const isCustomer = upperRole === "CUSTOMER" || upperRole === "BUSINESS_CLIENT";
+      const response   = isCustomer ? await getCustomerShipments() : await getAllShipments();
+      const data       = Array.isArray(response.data) ? response.data : [];
       setShipments(data.map(normalise));
       setError("");
     } catch (err) {
