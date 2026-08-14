@@ -448,10 +448,10 @@ function DeliveryConfirmationModal({ shipment, onClose, onConfirmed, showToast }
     return () => { if (resendTimerRef.current) clearInterval(resendTimerRef.current); };
   }, []);
 
-  // Start the 45-second countdown after each OTP send
+  // Start the 120-second countdown after each OTP send
   const startResendCountdown = () => {
     if (resendTimerRef.current) clearInterval(resendTimerRef.current);
-    setResendTimer(45);
+    setResendTimer(120);
     resendTimerRef.current = setInterval(() => {
       setResendTimer((prev) => {
         if (prev <= 1) {
@@ -482,7 +482,7 @@ function DeliveryConfirmationModal({ shipment, onClose, onConfirmed, showToast }
       setAttemptsLeft(5);
       setResendCount((c) => c + 1);
       setOtpStatus(null);
-      setOtpMessage(`OTP sent to ${data.maskedEmail}. Expires in 45 seconds.`);
+      setOtpMessage(`OTP sent to ${data.maskedEmail}. Expires in 120 seconds.`);
       startResendCountdown();
     } catch (err) {
       const msg = err?.response?.data?.message

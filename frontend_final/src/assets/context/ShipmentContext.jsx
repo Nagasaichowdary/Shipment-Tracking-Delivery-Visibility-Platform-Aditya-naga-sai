@@ -3,6 +3,7 @@ import { ShipmentContext } from "./shipments";
 import {
   getAllShipments,
   getCustomerShipments,
+  getMyShipments,           // Driver-specific: GET /api/driver/my-shipments
   createShipment as apiCreateShipment,
   updateShipmentStatus as apiUpdateStatus,
 } from "../services/api";
@@ -115,25 +116,47 @@ export function ShipmentProvider({ children }) {
 
   // -----------------------------------------------------------------
   // Fetch shipments from the backend on mount.
-  // CUSTOMER and BUSINESS_CLIENT roles call GET /api/shipments/my
-  // which is scoped to the authenticated user's own shipments.
-  // All other roles (ADMIN, DISPATCHER, DRIVER) call GET /api/shipments.
-  // The backend enforces this with @PreAuthorize on each endpoint —
-  // this role check is an additional layer, not the primary guard.
+  //
+  // Role → endpoint mapping (all enforced server-side by @PreAuthorize):
+  //   CUSTOMER / BUSINESS_CLIENT → GET /api/shipments/my
+  //       Returns only shipments where the user is receiver/sender/creator.
+  //   DRIVER                     → GET /api/driver/my-shipments
+  //       Returns only shipments assigned to this driver (findByAssignedDriver).
+  //       Calling GET /api/shipments is @PreAuthorize(ADMIN|DISPATCHER) and
+  //       returns 403 for DRIVER — this caused the "0 shipments" bug.
+  //   ADMIN / DISPATCHER / other → GET /api/shipments
+  //       Returns all shipments in the system.
+  //
+  // The backend enforces isolation at the repository level; this role check
+  // is an additional routing layer, not the primary security guard.
   // -----------------------------------------------------------------
   const fetchShipments = useCallback(async () => {
     setLoading(true);
     try {
       // Read role from sessionStorage — the same store AuthContext.jsx uses.
       // AuthContext persists the raw backend role name under the key "role"
-      // (e.g. "CUSTOMER", "ADMIN", "DISPATCHER"). We do a simple case-insensitive
-      // check rather than calling mapRole() to avoid importing a dependency.
+      // (e.g. "CUSTOMER", "ADMIN", "DISPATCHER", "DRIVER"). Case-insensitive.
       // Note: localStorage was WRONG — the auth system uses sessionStorage.
       const rawRole    = sessionStorage.getItem("role") || "";
       const upperRole  = rawRole.toUpperCase().replace(/\s+/g, "_");
       const isCustomer = upperRole === "CUSTOMER" || upperRole === "BUSINESS_CLIENT";
-      const response   = isCustomer ? await getCustomerShipments() : await getAllShipments();
-      const data       = Array.isArray(response.data) ? response.data : [];
+      const isDriver   = upperRole === "DRIVER";
+
+      let response;
+      if (isCustomer) {
+        // GET /api/shipments/my — scoped to authenticated user's own shipments
+        response = await getCustomerShipments();
+      } else if (isDriver) {
+        // GET /api/driver/my-shipments — scoped to this driver's assigned shipments only.
+        // Using getAllShipments() here would return 403 (Access Denied) because
+        // GET /api/shipments requires ADMIN or DISPATCHER role.
+        response = await getMyShipments();
+      } else {
+        // ADMIN / DISPATCHER — GET /api/shipments returns all system shipments
+        response = await getAllShipments();
+      }
+
+      const data = Array.isArray(response.data) ? response.data : [];
       setShipments(data.map(normalise));
       setError("");
     } catch (err) {

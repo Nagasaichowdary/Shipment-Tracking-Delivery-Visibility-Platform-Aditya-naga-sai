@@ -70,7 +70,7 @@ public class ShipmentController {
         this.podPdfService   = podPdfService;
     }
 
-    // @PreAuthorize("hasAnyRole('ADMIN', 'CUSTOMER')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'DISPATCHER', 'BUSINESS_CLIENT')")
     @PostMapping
     public ResponseEntity<ShipmentResponse> createShipment(
             @Valid @RequestBody CreateShipmentRequest request,
@@ -115,7 +115,7 @@ public class ShipmentController {
         return ResponseEntity.ok(shipmentService.getShipmentById(id));
     }
 
-    // @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'DISPATCHER')")
     @PutMapping("/{id}")
     public ResponseEntity<ShipmentResponse> updateShipment(
             @PathVariable Long id,
@@ -123,7 +123,7 @@ public class ShipmentController {
         return ResponseEntity.ok(shipmentService.updateShipment(id, request));
     }
 
-    // @PreAuthorize("hasRole('ADMIN')")
+    @PreAuthorize("hasAnyRole('ADMIN', 'DISPATCHER')")
     @DeleteMapping("/{id}")
     public ResponseEntity<ShipmentResponse> deleteShipment(@PathVariable Long id) {
         return ResponseEntity.ok(shipmentService.deleteShipment(id));
@@ -289,12 +289,7 @@ public class ShipmentController {
         return ResponseEntity.ok(shipmentService.getDelay(id));
     }
 
-    @GetMapping("/test-auth")
-    public org.springframework.http.ResponseEntity<String> testAuth() {
-        org.springframework.security.core.Authentication auth = org.springframework.security.core.context.SecurityContextHolder.getContext().getAuthentication();
-        boolean hasRole = auth.getAuthorities().stream().anyMatch(a -> a.getAuthority().equals("ROLE_DRIVER"));
-        return org.springframework.http.ResponseEntity.ok("ROLE_DRIVER present: " + hasRole);
-    }
+    // Debug endpoint removed before deployment.
 
     // ── Milestone 3: Delivery Confirmation + Proof of Delivery ───────────────
 

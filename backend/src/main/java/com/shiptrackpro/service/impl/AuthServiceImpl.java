@@ -81,8 +81,8 @@ public class AuthServiceImpl implements AuthService {
     private final Set<String> verifiedEmails =
             Collections.synchronizedSet(new HashSet<>());
 
-    /** Forgot-password OTPs keyed by normalised email */
-    private final Map<String, String> forgotPasswordOtpStore = new HashMap<>();
+    /** Forgot-password OTPs keyed by normalised email — uses OtpEntry for 120-second server-side expiry */
+    private final Map<String, OtpEntry> forgotPasswordOtpStore = new HashMap<>();
 
     /**
      * Delivery OTPs keyed by shipmentId.
@@ -404,14 +404,16 @@ public class AuthServiceImpl implements AuthService {
                         new RuntimeException("No account found with this email address."));
 
         String otp = String.format("%06d", new SecureRandom().nextInt(1_000_000));
-        forgotPasswordOtpStore.put(email, otp);
+        OtpEntry entry = new OtpEntry(otp);          // 120-second server-side expiry
+        forgotPasswordOtpStore.put(email, entry);
 
         sendOtpEmail(email, otp, "FORGOT-PASSWORD");
 
         return Map.of(
                 "success",     "true",
                 "maskedEmail", maskEmail(email),
-                "message",     "OTP sent successfully."
+                "message",     "OTP sent successfully.",
+                "expiresAt",   String.valueOf(entry.expiresAt.toEpochMilli())
         );
     }
 
@@ -419,12 +421,22 @@ public class AuthServiceImpl implements AuthService {
     public Map<String, String> verifyOtp(VerifyOtpRequest request) {
 
         String email = request.getEmail().trim().toLowerCase();
-        String storedOtp = forgotPasswordOtpStore.get(email);
+        OtpEntry entry = forgotPasswordOtpStore.get(email);
 
-        if (storedOtp == null || !storedOtp.equals(request.getOtp())) {
-            throw new RuntimeException("Invalid or expired OTP. Please try again.");
+        if (entry == null) {
+            throw new RuntimeException("No OTP found for this email. Please request a new one.");
         }
 
+        if (entry.isExpired()) {
+            forgotPasswordOtpStore.remove(email);
+            throw new RuntimeException("OTP has expired. Please request a new one.");
+        }
+
+        if (!entry.otp.equals(request.getOtp())) {
+            throw new RuntimeException("Invalid OTP. Please try again.");
+        }
+
+        // OTP is correct — leave it in store so resetPassword() can clear it
         return Map.of("success", "true", "message", "OTP verified successfully.");
     }
 
@@ -436,9 +448,16 @@ public class AuthServiceImpl implements AuthService {
         User user = userRepository.findByEmail(email)
                 .orElseThrow(() -> new RuntimeException("User account not found."));
 
+        // Re-validate the OTP entry has not expired between verifyOtp and resetPassword
+        OtpEntry entry = forgotPasswordOtpStore.get(email);
+        if (entry == null || entry.isExpired()) {
+            forgotPasswordOtpStore.remove(email);
+            throw new RuntimeException("OTP session has expired. Please restart the password reset flow.");
+        }
+
         user.setPassword(passwordEncoder.encode(request.getNewPassword()));
         userRepository.save(user);
-        forgotPasswordOtpStore.remove(email);
+        forgotPasswordOtpStore.remove(email);          // consume the OTP
 
         return Map.of("success", "true", "message", "Password reset successfully.");
     }

@@ -121,24 +121,29 @@ public interface ShipmentRepository extends JpaRepository<Shipment, Long> {
     // ─────────────────────────────────────────────────────────────────────────
 
     /**
-     * Returns all shipments where the given user is either the registered
-     * receiver ({@code receiver_user_id}) or the registered sender
-     * ({@code sender_user_id}).
+     * Returns all shipments where the given user is the registered receiver
+     * ({@code receiver_user_id}), the registered sender ({@code sender_user_id}),
+     * OR the creator ({@code created_by}).
      *
-     * <p>This is the correct ownership query for Customers: an Admin or
-     * Logistics Operator creates a shipment and selects the Customer as the
-     * receiver via {@code receiverUserId}. The Customer should then see that
-     * shipment in their "My Shipments" list.</p>
+     * <p>The {@code created_by} clause is the key addition for Business Client
+     * visibility: when a Business Client creates a shipment for a Customer, that
+     * shipment has {@code created_by = BC_user_id} but the BC is NOT the
+     * receiver/sender. Without this clause the BC sees nothing. Customers are
+     * unaffected because they never appear in {@code created_by}.</p>
+     *
+     * <p>DISTINCT is added to prevent duplicate rows when a Business Client is
+     * simultaneously the creator AND the receiver/sender of the same shipment.</p>
      *
      * <p>Ordered newest-first so the UI shows the most recent shipments at
      * the top without any additional sorting.</p>
      *
-     * @param userId the authenticated Customer's user ID (from JWT — never from the request)
-     * @return list of shipments associated with the user as sender or receiver
+     * @param userId the authenticated user's ID (from JWT — never from the request)
+     * @return deduplicated list of shipments associated with the user
      */
-    @Query("SELECT s FROM Shipment s " +
+    @Query("SELECT DISTINCT s FROM Shipment s " +
            "WHERE s.receiverUser.userId = :userId " +
            "OR s.senderUser.userId = :userId " +
+           "OR s.createdBy.userId = :userId " +
            "ORDER BY s.createdAt DESC")
     List<Shipment> findByReceiverOrSender(@Param("userId") Long userId);
 
