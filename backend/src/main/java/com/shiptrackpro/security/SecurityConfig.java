@@ -1,6 +1,7 @@
 package com.shiptrackpro.security;
 
 import org.springframework.beans.factory.annotation.Autowired;
+import org.springframework.beans.factory.annotation.Value;
 import org.springframework.context.annotation.Bean;
 import org.springframework.context.annotation.Configuration;
 import org.springframework.security.authentication.AuthenticationManager;
@@ -18,10 +19,11 @@ import org.springframework.web.cors.CorsConfiguration;
 import org.springframework.web.cors.CorsConfigurationSource;
 import org.springframework.web.cors.UrlBasedCorsConfigurationSource;
 
+import java.util.ArrayList;
 import java.util.List;
 
 @Configuration
-@EnableMethodSecurity          // enables @PreAuthorize on controller methods
+@EnableMethodSecurity
 public class SecurityConfig {
 
     @Autowired
@@ -30,71 +32,96 @@ public class SecurityConfig {
     @Autowired
     private CustomUserDetailsService customUserDetailsService;
 
+    @Value("${app.frontend-url:http://localhost:5173}")
+    private String frontendUrl;
+
     @Bean
     public PasswordEncoder passwordEncoder() {
         return new BCryptPasswordEncoder();
     }
+
     @Bean
-public CorsConfigurationSource corsConfigurationSource() {
+    public CorsConfigurationSource corsConfigurationSource() {
 
-    CorsConfiguration configuration = new CorsConfiguration();
+        CorsConfiguration configuration = new CorsConfiguration();
 
-    // Cover all common Vite dev-server ports (5173 is default, but it increments
-    // when the port is busy — a CORS mismatch here causes ALL auth calls to fail
-    // with a network error that the frontend shows as "Failed to send OTP.")
-    configuration.setAllowedOrigins(
-            List.of(
-                "http://localhost:5173",
-                "http://localhost:5174",
-                "http://localhost:5175",
-                "http://localhost:5176",
-                "http://localhost:5177",
-                "http://127.0.0.1:5173",
-                "http://127.0.0.1:5174",
-                "http://127.0.0.1:5175"
-            )
-    );
+        List<String> allowedOrigins = new ArrayList<>(
+                List.of(
+                        "http://localhost:5173",
+                        "http://localhost:5174",
+                        "http://localhost:5175",
+                        "http://localhost:5176",
+                        "http://localhost:5177",
+                        "http://127.0.0.1:5173",
+                        "http://127.0.0.1:5174",
+                        "http://127.0.0.1:5175"
+                )
+        );
 
-    configuration.setAllowedMethods(
-            List.of("GET", "POST", "PUT", "PATCH", "DELETE", "OPTIONS", "HEAD")
-    );
+        if (frontendUrl != null
+                && !frontendUrl.isBlank()
+                && !allowedOrigins.contains(frontendUrl)) {
+            allowedOrigins.add(frontendUrl);
+        }
 
-    configuration.setAllowedHeaders(
-            List.of("*")
-    );
+        configuration.setAllowedOrigins(allowedOrigins);
 
-    configuration.setAllowCredentials(true);
+        configuration.setAllowedMethods(
+                List.of(
+                        "GET",
+                        "POST",
+                        "PUT",
+                        "PATCH",
+                        "DELETE",
+                        "OPTIONS",
+                        "HEAD"
+                )
+        );
 
-    UrlBasedCorsConfigurationSource source =
-            new UrlBasedCorsConfigurationSource();
+        configuration.setAllowedHeaders(
+                List.of("*")
+        );
 
-    source.registerCorsConfiguration("/**", configuration);
+        configuration.setAllowCredentials(true);
 
-    return source;
-}
+        UrlBasedCorsConfigurationSource source =
+                new UrlBasedCorsConfigurationSource();
+
+        source.registerCorsConfiguration("/**", configuration);
+
+        return source;
+    }
 
     @Bean
     public AuthenticationProvider authenticationProvider() {
-        DaoAuthenticationProvider provider = new DaoAuthenticationProvider();
+        DaoAuthenticationProvider provider =
+                new DaoAuthenticationProvider();
+
         provider.setUserDetailsService(customUserDetailsService);
         provider.setPasswordEncoder(passwordEncoder());
+
         return provider;
     }
 
     @Bean
     public AuthenticationManager authenticationManager(
-            AuthenticationConfiguration config) throws Exception {
+            AuthenticationConfiguration config
+    ) throws Exception {
         return config.getAuthenticationManager();
     }
 
     @Bean
-    public SecurityFilterChain securityFilterChain(HttpSecurity http) throws Exception {
+    public SecurityFilterChain securityFilterChain(
+            HttpSecurity http
+    ) throws Exception {
 
         http
                 .cors(cors -> {})
                 .csrf(csrf -> csrf.disable())
                 .sessionManagement(session ->
-                        session.sessionCreationPolicy(SessionCreationPolicy.STATELESS)
+                        session.sessionCreationPolicy(
+                                SessionCreationPolicy.STATELESS
+                        )
                 )
                 .authenticationProvider(authenticationProvider())
                 .authorizeHttpRequests(auth ->
@@ -103,9 +130,12 @@ public CorsConfigurationSource corsConfigurationSource() {
                                         "/api/auth/**",
                                         "/api/roles",
                                         "/api/roles/**"
-                                ).permitAll()
-                                .requestMatchers("/api/admin/**").hasRole("ADMIN")
-                                .anyRequest().authenticated()
+                                )
+                                .permitAll()
+                                .requestMatchers("/api/admin/**")
+                                .hasRole("ADMIN")
+                                .anyRequest()
+                                .authenticated()
                 )
                 .addFilterBefore(
                         jwtAuthenticationFilter,
