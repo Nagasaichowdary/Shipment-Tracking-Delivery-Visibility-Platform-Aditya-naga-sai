@@ -1,4 +1,4 @@
-import { useContext } from "react";
+﻿import { useContext } from "react";
 import { useLocation, useNavigate } from "react-router-dom";
 import { AuthContext } from "../../context/auth";
 import NotificationBell from "./NotificationBell";
@@ -8,7 +8,7 @@ const titles = {
   "/shipments": ["Shipment Management", "Create, monitor, and update shipment lifecycle records"],
   "/shipments/new": ["Create Shipment", "Register a new package into the tracking workflow"],
   "/track": ["Tracking Dashboard", "Search by tracking number and view delivery progress"],
-  "/profile": ["Profile & Access", "JWT session preview and role capabilities"],
+  "/profile": ["Profile & Access", "Account information and role capabilities"],
 };
 
 function Navbar() {

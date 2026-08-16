@@ -1,4 +1,4 @@
-import { useContext, useState } from "react";
+﻿import { useContext } from "react";
 import { AuthContext } from "../context/auth";
 
 // ─── Helpers ────────────────────────────────────────────────────────────────
@@ -12,14 +12,6 @@ function getInitials(firstName, lastName) {
   return "?";
 }
 
-/**
- * Returns a masked JWT preview showing only the first 40 characters
- * so no credential is fully exposed in the UI.
- */
-function maskToken(token) {
-  if (!token) return "No active session";
-  return `${token.slice(0, 40)}…`;
-}
 
 /**
  * Decodes the JWT payload (second base64 segment) without any library.
@@ -63,7 +55,6 @@ const roleColor = {
 
 function Profile() {
   const { auth, capabilities } = useContext(AuthContext);
-  const [copied, setCopied] = useState(false);
 
   const role      = auth?.user?.role      || "Unknown Role";
   const firstName = auth?.user?.firstName || "";
@@ -85,13 +76,6 @@ function Profile() {
 
   const accent = roleColor[role] || "#2563eb";
 
-  const handleCopyToken = () => {
-    if (!token) return;
-    navigator.clipboard.writeText(token).then(() => {
-      setCopied(true);
-      setTimeout(() => setCopied(false), 2000);
-    });
-  };
 
   return (
     <div className="page">
@@ -242,48 +226,6 @@ function Profile() {
               </p>
             </div>
 
-            {/* Token preview — masked, with copy button */}
-            <div className="schema-box">
-              <div
-                style={{
-                  display: "flex",
-                  alignItems: "center",
-                  justifyContent: "space-between",
-                  gap: 8,
-                }}
-              >
-                <strong>JWT token</strong>
-                <button
-                  onClick={handleCopyToken}
-                  disabled={!token}
-                  style={{
-                    fontSize: 11,
-                    padding: "2px 10px",
-                    borderRadius: 5,
-                    border: "1px solid #2563eb",
-                    background: copied ? "#10b981" : "transparent",
-                    color: copied ? "#fff" : "#2563eb",
-                    cursor: token ? "pointer" : "not-allowed",
-                    transition: "all 0.2s",
-                    fontWeight: 600,
-                  }}
-                >
-                  {copied ? "Copied ✓" : "Copy token"}
-                </button>
-              </div>
-              <p
-                className="subtle"
-                style={{
-                  margin: "8px 0 0",
-                  wordBreak: "break-all",
-                  fontFamily: "monospace",
-                  fontSize: 12,
-                  lineHeight: 1.6,
-                }}
-              >
-                {maskToken(token)}
-              </p>
-            </div>
           </div>
 
           {/* Role Capabilities — dynamic from auth.js roleCapabilities */}
