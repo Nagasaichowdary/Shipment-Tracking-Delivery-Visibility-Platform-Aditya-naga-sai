@@ -10,6 +10,7 @@ function Register() {
   const navigate = useNavigate();
   const [feedback, setFeedback] = useState({ type: "", message: "" });
   const [roles, setRoles] = useState([]);
+  const [rolesLoading, setRolesLoading] = useState(true);
   const [showOtp, setShowOtp] = useState(false);
   const [otpData, setOtpData] = useState({ expiresAt: 0, maskedEmail: '' });
   const [form, setForm] = useState({
@@ -32,12 +33,17 @@ function Register() {
   useEffect(() => {
     const fetchRoles = async () => {
       try {
+        setRolesLoading(true);
         const response = await getRoles();
-        console.log("Roles fetched:", response);
         setRoles(response.data);
       } catch (error) {
         console.error("Failed to load roles:", error);
-        console.error("Error details:", error.response || error.message);
+        setFeedback({
+          type: "error",
+          message: "Could not load registration options. Please refresh the page or try again later.",
+        });
+      } finally {
+        setRolesLoading(false);
       }
     };
     fetchRoles();
@@ -221,8 +227,14 @@ function Register() {
         onChange={handleChange}
         required
       >
-        <option value="">Select Role</option>
-        {roles.map((role) => (
+        <option value="" disabled>
+          {rolesLoading
+            ? "Loading roles\u2026"
+            : roles.length === 0
+            ? "No roles available \u2014 refresh page"
+            : "Select your role"}
+        </option>
+        {!rolesLoading && roles.map((role) => (
           <option key={role.roleId} value={role.roleId}>
             {mapRole(role.roleName)}
           </option>
