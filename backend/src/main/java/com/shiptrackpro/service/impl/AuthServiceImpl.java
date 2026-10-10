@@ -20,8 +20,12 @@ import com.shiptrackpro.security.JwtService;
 import com.shiptrackpro.service.AuthService;
 import org.springframework.beans.factory.annotation.Autowired;
 import org.springframework.beans.factory.annotation.Value;
-import org.springframework.mail.javamail.JavaMailSender;
-import org.springframework.mail.javamail.MimeMessageHelper;
+import org.springframework.web.client.RestClient;
+import org.springframework.http.MediaType;
+import com.fasterxml.jackson.core.JsonProcessingException;
+import com.fasterxml.jackson.databind.ObjectMapper;
+import org.springframework.web.client.HttpClientErrorException;
+import org.springframework.web.client.HttpServerErrorException;
 import org.springframework.security.authentication.AuthenticationManager;
 import org.springframework.security.authentication.UsernamePasswordAuthenticationToken;
 import org.springframework.security.crypto.password.PasswordEncoder;
@@ -32,7 +36,7 @@ import com.google.api.client.googleapis.auth.oauth2.GoogleIdTokenVerifier;
 import com.google.api.client.http.javanet.NetHttpTransport;
 import com.google.api.client.json.gson.GsonFactory;
 
-import jakarta.mail.internet.MimeMessage;
+// jakarta.mail removed — OTP email now sent via Brevo HTTPS API
 import java.security.SecureRandom;
 import java.time.Instant;
 import java.util.*;
@@ -60,17 +64,17 @@ public class AuthServiceImpl implements AuthService {
     @Autowired private AuthenticationManager authenticationManager;
     @Autowired private JwtService jwtService;
 
-    /** Injected only when spring-boot-starter-mail is on the classpath
-     *  and spring.mail.host is configured. Falls back to console log if null. */
-    @Autowired(required = false)
-    private JavaMailSender mailSender;
+    /** Brevo transactional email API key loaded from BREVO_API_KEY.
+     *  NEVER log this value. */
+    @Value("${brevo.api-key:}")
+    private String brevoApiKey;
 
-    /**
-     * The Gmail address used for SMTP authentication.
-     * IMPORTANT: Gmail SMTP requires the From address to EXACTLY match this value.
-     */
-    @Value("${spring.mail.username:}")
-    private String mailFromAddress;
+    /** Verified sender address registered in Brevo (matches BREVO_SENDER_EMAIL). */
+    @Value("${brevo.sender-email:}")
+    private String brevoSenderEmail;
+
+    /** Brevo transactional email REST endpoint (HTTPS — no SMTP port needed). */
+    private static final String BREVO_API_URL = "https://api.brevo.com/v3/smtp/email";
 
     // ── In-memory OTP stores ────────────────────────────────────
 
@@ -158,15 +162,19 @@ public class AuthServiceImpl implements AuthService {
         OtpEntry entry = new OtpEntry(otp);
         registrationOtpStore.put(email, entry);
 
-        // Attempt to deliver the OTP via email; fall back to console
-        sendOtpEmail(email, otp, "REGISTRATION"); // TEMPORARY-DIAG caller label
+        // Send OTP via Brevo HTTPS API; roll back the store entry if delivery fails
+        // so an undelivered OTP cannot be verified.
+        try {
+            sendOtpEmail(email, otp, "REGISTRATION");
+        } catch (RuntimeException ex) {
+            registrationOtpStore.remove(email);
+            throw ex;
+        }
 
         // Return masked email + expiry epoch-ms so the frontend can
         // calculate remaining time from the real server timestamp
         // (fixes browser tab-switch timer freeze caused by setInterval throttling)
         String maskedEmail = maskEmail(email);
-
-        System.out.println("[ShipTrackPro] Registration OTP for " + email + " \u2192 " + otp);
 
         return Map.of(
                 "success",     "true",
@@ -405,9 +413,23 @@ public class AuthServiceImpl implements AuthService {
 
         String otp = String.format("%06d", new SecureRandom().nextInt(1_000_000));
         OtpEntry entry = new OtpEntry(otp);          // 120-second server-side expiry
+        // Preserve the previous OTP entry so we can restore it if email delivery fails.
+        // A resend that fails should not invalidate a previously sent (and still valid) OTP.
+        OtpEntry previousFpEntry = forgotPasswordOtpStore.get(email);
         forgotPasswordOtpStore.put(email, entry);
 
-        sendOtpEmail(email, otp, "FORGOT-PASSWORD");
+        try {
+            sendOtpEmail(email, otp, "FORGOT-PASSWORD");
+        } catch (RuntimeException ex) {
+            // Restore the previous state: reinstate the old OTP if one existed,
+            // or remove the entry entirely if this was the first request.
+            if (previousFpEntry != null) {
+                forgotPasswordOtpStore.put(email, previousFpEntry);
+            } else {
+                forgotPasswordOtpStore.remove(email);
+            }
+            throw ex;
+        }
 
         return Map.of(
                 "success",     "true",
@@ -516,20 +538,40 @@ public class AuthServiceImpl implements AuthService {
         // 5. Generate a cryptographically secure 6-digit OTP
         String otp = String.format("%06d", new SecureRandom().nextInt(1_000_000));
 
-        // 6. Store OTP — overwrites any previous OTP, invalidating it immediately
+        // 6. Store the new OTP, overwriting any previous entry.
+        //    The previous entry (captured above as `existing`) is retained in a local
+        //    variable so the store can be restored if email delivery fails.
         int nextResendCount = currentResendCount + 1;
         DeliveryOtpEntry entry = new DeliveryOtpEntry(otp, nextResendCount);
         deliveryOtpStore.put(shipmentId, entry);
 
-        // 7. Remove any previous OTP-verified status for this shipment
-        //    (resend must re-verify — old verification is invalid)
+        // 7. Snapshot whether the shipment was already verified before this resend
+        //    so the verified status can be accurately restored if email delivery fails.
+        boolean wasVerified = deliveryVerifiedSet.contains(shipmentId);
+
+        // 8. Clear the verified flag - a resend requires OTP verification again.
+        //    On email failure this is rolled back below.
         deliveryVerifiedSet.remove(shipmentId);
 
-        // 8. Send OTP email to customer
-        sendDeliveryOtpEmail(customerEmail, otp);
-
-        System.out.println("[ShipTrackPro] Delivery OTP generated for shipment " + shipmentId +
-                " → sent to " + maskEmail(customerEmail) + " (resend #" + nextResendCount + ")");
+        // 9. Send OTP email to customer; roll back both the OTP store and the
+        //    verified-set if delivery fails so no undelivered OTP can be used.
+        try {
+            sendDeliveryOtpEmail(customerEmail, otp);
+        } catch (RuntimeException ex) {
+            // Restore previous OTP entry (null means there was none before this call).
+            if (existing != null) {
+                deliveryOtpStore.put(shipmentId, existing);
+            } else {
+                deliveryOtpStore.remove(shipmentId);
+            }
+            // Restore verified status precisely: if the shipment was already verified
+            // before this resend attempt, that verification remains valid because the
+            // new OTP was never delivered. If it was not verified, leave it unverified.
+            if (wasVerified) {
+                deliveryVerifiedSet.add(shipmentId);
+            }
+            throw ex;
+        }
 
         return Map.of(
                 "success",          "true",
@@ -630,88 +672,115 @@ public class AuthServiceImpl implements AuthService {
     // ── Private Helpers ─────────────────────────────────────────
 
     /**
-     * Sends an OTP email using the appropriate template for the caller type.
-     * Supported callers: "REGISTRATION", "FORGOT-PASSWORD", "DELIVERY".
+     * Sends an OTP email via the Brevo HTTPS API.
+     * Supported callers: "REGISTRATION", "FORGOT-PASSWORD".
+     * OTP generation, storage, expiry, verification, and limits are unchanged.
+     * Throws RuntimeException if Brevo is not configured or delivery fails
+     * so the endpoint returns an error instead of silently claiming success.
      */
     private void sendOtpEmail(String toEmail, String otp, String caller) {
-        boolean mailConfigured = mailSender != null
-                && mailFromAddress != null
-                && !mailFromAddress.isBlank()
-                && !mailFromAddress.equals("YOUR_GMAIL_ADDRESS@gmail.com");
-
-        if (!mailConfigured) {
-            System.out.println("=========================================");
-            System.out.println("[ShipTrackPro] Mail not configured — console fallback.");
-            System.out.println("Caller : " + caller);
-            System.out.println("Email  : " + toEmail);
-            System.out.println("OTP    : " + otp);
-            System.out.println("=========================================");
-            return;
+        if (brevoApiKey == null || brevoApiKey.isBlank()
+                || brevoSenderEmail == null || brevoSenderEmail.isBlank()) {
+            throw new RuntimeException(
+                    "Email delivery is not configured. Please contact support.");
         }
 
-        try {
-            MimeMessage message = mailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
-            helper.setFrom(mailFromAddress, "Shipment Tracker Pro");
-            helper.setTo(toEmail);
-
-            switch (caller) {
-                case "FORGOT-PASSWORD" -> {
-                    helper.setSubject("Shipment Tracker Pro — Password Reset Code");
-                    helper.setText(buildForgotPasswordEmailTemplate(otp), true);
-                }
-                default -> {
-                    // REGISTRATION and any other caller uses the registration template
-                    helper.setSubject("Your Shipment Tracker Pro Verification Code");
-                    helper.setText(buildEmailTemplate(otp), true);
-                }
+        String subject;
+        String htmlBody;
+        switch (caller) {
+            case "FORGOT-PASSWORD" -> {
+                subject  = "Shipment Tracker Pro \u2014 Password Reset Code";
+                htmlBody = buildForgotPasswordEmailTemplate(otp);
             }
-
-            mailSender.send(message);
-            System.out.println("[ShipTrackPro] OTP email dispatched to: " + toEmail + " [" + caller + "]");
-        } catch (Exception e) {
-            System.out.println("[ShipTrackPro] Email delivery failed for " + toEmail +
-                    " [" + caller + "]: " + e.getMessage());
+            default -> {
+                subject  = "Your Shipment Tracker Pro Verification Code";
+                htmlBody = buildEmailTemplate(otp);
+            }
         }
+
+        // sendViaBrevo throws RuntimeException on any delivery failure.
+        sendViaBrevo(toEmail, subject, htmlBody, caller);
     }
 
     /**
-     * Sends a delivery OTP email to the customer.
-     * Uses a dedicated green-themed template clearly distinct from Registration
-     * (blue) and Forgot-Password (blue) templates.
+     * Sends a delivery OTP email to the customer via the Brevo HTTPS API.
+     * OTP generation, storage, expiry, verification, and resend limits are UNCHANGED.
+     * Throws RuntimeException if Brevo is not configured or delivery fails.
      */
     private void sendDeliveryOtpEmail(String toEmail, String otp) {
-        boolean mailConfigured = mailSender != null
-                && mailFromAddress != null
-                && !mailFromAddress.isBlank()
-                && !mailFromAddress.equals("YOUR_GMAIL_ADDRESS@gmail.com");
+        if (brevoApiKey == null || brevoApiKey.isBlank()
+                || brevoSenderEmail == null || brevoSenderEmail.isBlank()) {
+            throw new RuntimeException(
+                    "Email delivery is not configured. Please contact support.");
+        }
 
-        if (!mailConfigured) {
-            System.out.println("=========================================");
-            System.out.println("[ShipTrackPro] Mail not configured — console fallback.");
-            System.out.println("Caller : DELIVERY");
-            System.out.println("Email  : " + toEmail);
-            System.out.println("OTP    : " + otp);
-            System.out.println("=========================================");
-            return;
+        // sendViaBrevo throws RuntimeException on any delivery failure.
+        sendViaBrevo(toEmail,
+                "Shipment Tracker Pro \u2014 Your Delivery Verification Code",
+                buildDeliveryOtpEmailTemplate(otp),
+                "DELIVERY");
+    }
+
+    /**
+     * Sends a transactional email through the Brevo HTTPS API.
+     * Uses Spring RestClient (Spring Boot 3.2+, no SMTP port required).
+     * JSON is serialized via Jackson ObjectMapper — all HTML special characters
+     * (quotes, backslashes, newlines) are handled correctly.
+     * The API key is transmitted in an HTTP header and is NEVER logged.
+     *
+     * @param toEmail   recipient email address
+     * @param subject   email subject line
+     * @param htmlBody  full HTML email body built by the template helpers
+     * @param caller    label used only in safe diagnostic log messages
+     * @throws RuntimeException on serialisation failure, 4xx, 5xx, or network error
+     */
+    private void sendViaBrevo(String toEmail, String subject, String htmlBody, String caller) {
+        String json;
+        try {
+            ObjectMapper mapper = new ObjectMapper();
+            json = mapper.writeValueAsString(Map.of(
+                    "sender",      Map.of("name", "ShipTrack Pro", "email", brevoSenderEmail),
+                    "to",          List.of(Map.of("email", toEmail)),
+                    "subject",     subject,
+                    "htmlContent", htmlBody
+            ));
+        } catch (JsonProcessingException ex) {
+            // Cannot occur for a simple Map<String, Object> — treat as fatal.
+            throw new RuntimeException("Failed to prepare email payload. Please try again.");
         }
 
         try {
-            MimeMessage message = mailSender.createMimeMessage();
-            MimeMessageHelper helper = new MimeMessageHelper(message, true, "UTF-8");
-            helper.setFrom(mailFromAddress, "Shipment Tracker Pro");
-            helper.setTo(toEmail);
-            helper.setSubject("Shipment Tracker Pro — Your Delivery Verification Code");
-            helper.setText(buildDeliveryOtpEmailTemplate(otp), true);
-            mailSender.send(message);
-            System.out.println("[ShipTrackPro] Delivery OTP email dispatched to: " + maskEmail(toEmail));
-        } catch (Exception e) {
-            System.out.println("[ShipTrackPro] Delivery OTP email failed for " +
-                    maskEmail(toEmail) + ": " + e.getMessage());
+            RestClient.builder()
+                    .baseUrl(BREVO_API_URL)
+                    .defaultHeader("accept",       "application/json")
+                    .defaultHeader("api-key",      brevoApiKey)
+                    .defaultHeader("content-type", MediaType.APPLICATION_JSON_VALUE)
+                    .build()
+                    .post()
+                    .body(json)
+                    .retrieve()
+                    .body(String.class);
+
+            System.out.println("[ShipTrackPro] OTP email sent via Brevo [" + caller + "]");
+
+        } catch (HttpClientErrorException ex) {
+            // 4xx — wrong API key, unverified sender, or account issue.
+            System.out.println("[ShipTrackPro] Brevo 4xx [" + caller + "]: HTTP " + ex.getStatusCode());
+            throw new RuntimeException(
+                    "Email delivery failed (provider configuration error). Please try again later.");
+        } catch (HttpServerErrorException ex) {
+            // 5xx — Brevo server-side error.
+            System.out.println("[ShipTrackPro] Brevo 5xx [" + caller + "]: HTTP " + ex.getStatusCode());
+            throw new RuntimeException(
+                    "Email delivery failed (provider temporarily unavailable). Please try again later.");
+        } catch (Exception ex) {
+            // Network timeout, connection refused, or other runtime error.
+            System.out.println("[ShipTrackPro] Brevo unreachable [" + caller + "]: " + ex.getClass().getSimpleName());
+            throw new RuntimeException(
+                    "Email delivery failed (network error). Please try again later.");
         }
     }
 
-    /** Returns a masked version of the email for UI display, e.g. adi***@gmail.com */
     private String maskEmail(String email) {
         String[] parts = email.split("@");
         int visibleChars = Math.min(3, parts[0].length());
