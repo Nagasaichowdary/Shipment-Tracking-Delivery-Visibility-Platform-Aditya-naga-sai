@@ -5,19 +5,30 @@ import { WifiOff, RefreshCw, AlertCircle, CheckCircle } from "lucide-react";
 /*
  * OfflinePopup — Global internet-connection monitor for ShipTrack Pro
  * -------------------------------------------------------------------------
- * Detects connectivity loss via:
- *   1. window "offline" / "online" events  (primary)
- *   2. navigator.onLine polling every 2 s  (fallback — Edge DevTools sometimes
- *      does not fire the DOM event when Network throttle is set to Offline)
+ * Detection strategy (three complementary layers):
  *
- * On each state change a fetch probe against /api/roles confirms real
- * connectivity before closing the popup (navigator.onLine is unreliable).
+ *   Layer 1 — DOM events
+ *     window "offline" / "online" events fire immediately when the OS
+ *     propagates the network state change. Fastest path, but not guaranteed
+ *     on every OS/browser combination.
  *
- * CENTERING FIX: framer-motion rewrites the CSS transform property on every
- * animation frame (to apply scale / y). If "transform: translate(-50%,-50%)"
- * is placed in the motion.div style it is silently overwritten, pushing the
- * card off-screen. The fix is a fixed full-viewport flexbox wrapper div that
- * centres the card without relying on CSS transform.
+ *   Layer 2 — navigator.onLine poll (every 2 s)
+ *     Catches the DevTools Network → Offline case where some Edge/Chrome
+ *     builds do not fire the DOM event.
+ *
+ *   Layer 3 — Proactive background fetch probe (every 20 s, while online)
+ *     Catches actual physical disconnections where the OS takes 5-30 s to
+ *     update navigator.onLine.  Probes /api/roles (existing public endpoint,
+ *     no side-effects).  Only triggers the popup after FAILURE_THRESHOLD (2)
+ *     consecutive failures so that a single Render cold-start or momentary
+ *     hiccup does NOT falsely claim the user's internet is down.
+ *
+ * Recovery: the popup closes only after a successful probe — never on a bare
+ * browser "online" event or navigator.onLine flip alone.
+ *
+ * CENTERING: framer-motion overwrites CSS `transform` every frame when scale/y
+ * are animated.  A fixed full-viewport flexbox wrapper centres the card
+ * safely, with no transform on the motion.div card itself.
  * -------------------------------------------------------------------------
  */
 
@@ -25,9 +36,11 @@ const API_BASE =
   import.meta.env.VITE_API_BASE_URL ||
   "https://shipment-tracking-delivery-visibility.onrender.com";
 
-const PROBE_URL        = `${API_BASE}/api/roles`;
-const PROBE_TIMEOUT_MS = 6000;
-const POLL_INTERVAL_MS = 2000; // navigator.onLine poll while potentially offline
+const PROBE_URL           = `${API_BASE}/api/roles`;
+const PROBE_TIMEOUT_MS    = 6000;  // per-probe fetch timeout
+const POLL_INTERVAL_MS    = 2000;  // navigator.onLine poll interval
+const PERIODIC_CHECK_MS   = 20000; // background fetch probe interval while online
+const FAILURE_THRESHOLD   = 2;     // consecutive probe failures before showing popup
 
 async function probeConnectivity() {
   const controller = new AbortController();
@@ -52,12 +65,21 @@ export default function OfflinePopup() {
   const [stillOffline,  setStillOffline]  = useState(false);
   const [justRecovered, setJustRecovered] = useState(false);
 
-  const autoCheckTimerRef = useRef(null);
-  const pollTimerRef      = useRef(null);
-  const probingRef        = useRef(false);
+  const autoCheckTimerRef    = useRef(null);  // 30-s auto-retry while popup shows
+  const pollTimerRef         = useRef(null);  // 2-s navigator.onLine poll
+  const periodicCheckTimerRef = useRef(null); // 20-s background fetch probe
+  const probingRef           = useRef(false); // mutex — prevent concurrent probes
+  const consecutiveFailures  = useRef(0);     // failure counter for threshold logic
+  const isOfflineRef         = useRef(false); // mirror of isOffline for use in timers
 
-  // ── Probe connectivity and update state ──────────────────────────────────
-  const runProbe = useCallback(async () => {
+  // Keep isOfflineRef in sync with state (timers can't read current state)
+  useEffect(() => { isOfflineRef.current = isOffline; }, [isOffline]);
+
+  // ── Core: probe + update state ───────────────────────────────────────────
+  // Used by: manual Refresh button, auto-retry, and background check.
+  // Called with resetThreshold=true only from background check; false from
+  // manual/auto calls so an explicit user action always shows the spinner.
+  const runProbe = useCallback(async ({ resetThreshold = false } = {}) => {
     if (probingRef.current) return;
     probingRef.current = true;
     setChecking(true);
@@ -69,24 +91,40 @@ export default function OfflinePopup() {
     probingRef.current = false;
 
     if (online) {
-      setJustRecovered(true);
-      // Brief "back online" flash, then dismiss.
-      setTimeout(() => {
-        setIsOffline(false);
-        setJustRecovered(false);
-        setStillOffline(false);
-      }, 1200);
+      consecutiveFailures.current = 0;
+      if (isOfflineRef.current) {
+        // We're recovering — show the "Back Online" flash then dismiss.
+        setJustRecovered(true);
+        setTimeout(() => {
+          setIsOffline(false);
+          setJustRecovered(false);
+          setStillOffline(false);
+        }, 1200);
+      }
     } else {
-      setStillOffline(true);
+      if (resetThreshold) {
+        // Background probe path — count consecutive failures.
+        consecutiveFailures.current += 1;
+        if (consecutiveFailures.current >= FAILURE_THRESHOLD) {
+          // Only show popup when threshold is reached, not on first failure.
+          setIsOffline(true);
+          setStillOffline(false);
+          setJustRecovered(false);
+        }
+        // Do NOT set stillOffline here — popup may not be visible yet.
+      } else {
+        // Manual / auto-retry path — popup is already showing.
+        setStillOffline(true);
+      }
     }
   }, []);
 
-  // ── navigator.onLine polling (fallback for DevTools Offline) ────────────
-  // Stops itself once online; restarts when offline is detected.
+  // ── Layer 2: navigator.onLine poll (2 s) ─────────────────────────────────
   const startPoll = useCallback(() => {
-    if (pollTimerRef.current) return; // already running
+    if (pollTimerRef.current) return;
     pollTimerRef.current = setInterval(() => {
       if (!navigator.onLine) {
+        consecutiveFailures.current = FAILURE_THRESHOLD; // instant trigger
         setIsOffline(true);
         setStillOffline(false);
         setJustRecovered(false);
@@ -101,45 +139,75 @@ export default function OfflinePopup() {
     }
   }, []);
 
-  // ── DOM event handlers ───────────────────────────────────────────────────
+  // ── Layer 3: background fetch probe (20 s, only while apparently online) ──
+  // Catches physical disconnections where the OS delays updating onLine.
+  // Stops while the popup is showing (auto-retry handles that at 30 s).
+  const startPeriodicCheck = useCallback(() => {
+    if (periodicCheckTimerRef.current) return;
+    periodicCheckTimerRef.current = setInterval(() => {
+      // Skip if popup is already showing or a probe is in progress.
+      if (isOfflineRef.current || probingRef.current) return;
+      runProbe({ resetThreshold: true });
+    }, PERIODIC_CHECK_MS);
+  }, [runProbe]);
+
+  const stopPeriodicCheck = useCallback(() => {
+    if (periodicCheckTimerRef.current) {
+      clearInterval(periodicCheckTimerRef.current);
+      periodicCheckTimerRef.current = null;
+    }
+  }, []);
+
+  // ── Layer 1: DOM event handlers ──────────────────────────────────────────
   const handleOffline = useCallback(() => {
+    consecutiveFailures.current = FAILURE_THRESHOLD; // immediate
     setIsOffline(true);
     setStillOffline(false);
     setJustRecovered(false);
-    startPoll(); // keep polling in case future "online" event is also missed
-  }, [startPoll]);
+  }, []);
 
   const handleOnline = useCallback(() => {
-    // Browser says we're back — probe before trusting it.
-    runProbe();
+    // Browser says we're back — probe to confirm before closing popup.
+    runProbe({ resetThreshold: false });
   }, [runProbe]);
 
-  // ── Mount: register events, check initial state, start poll ─────────────
+  // ── Mount ─────────────────────────────────────────────────────────────────
   useEffect(() => {
+    // Check state immediately on mount.
     if (!navigator.onLine) {
+      consecutiveFailures.current = FAILURE_THRESHOLD;
       setIsOffline(true);
-      startPoll();
     }
 
     window.addEventListener("offline", handleOffline);
     window.addEventListener("online",  handleOnline);
 
-    // Always run the poll so we catch DevTools Offline that skips the event.
-    startPoll();
+    startPoll();           // Layer 2
+    startPeriodicCheck();  // Layer 3
 
     return () => {
       window.removeEventListener("offline", handleOffline);
       window.removeEventListener("online",  handleOnline);
       stopPoll();
+      stopPeriodicCheck();
       if (autoCheckTimerRef.current) clearTimeout(autoCheckTimerRef.current);
     };
     // eslint-disable-next-line react-hooks/exhaustive-deps
-  }, []); // run once on mount only
+  }, []); // intentionally once on mount
 
-  // ── Stop poll once we confirm we're online ───────────────────────────────
+  // ── Pause / resume periodic check based on popup visibility ──────────────
   useEffect(() => {
-    if (!isOffline) stopPoll();
-  }, [isOffline, stopPoll]);
+    if (isOffline) {
+      // Popup is showing — pause background probe (auto-retry covers this).
+      stopPeriodicCheck();
+      stopPoll();
+    } else {
+      // Back online — reset failure counter and resume checks.
+      consecutiveFailures.current = 0;
+      startPoll();
+      startPeriodicCheck();
+    }
+  }, [isOffline, startPoll, stopPoll, startPeriodicCheck, stopPeriodicCheck]);
 
   // ── Auto-retry every 30 s while popup is showing ─────────────────────────
   useEffect(() => {
@@ -152,8 +220,7 @@ export default function OfflinePopup() {
     }
     function scheduleNext() {
       autoCheckTimerRef.current = setTimeout(async () => {
-        if (!probingRef.current) await runProbe();
-        // scheduleNext() will be called again by the effect re-run if still offline
+        if (!probingRef.current) await runProbe({ resetThreshold: false });
       }, 30_000);
     }
     scheduleNext();
@@ -162,10 +229,12 @@ export default function OfflinePopup() {
     };
   }, [isOffline, runProbe]);
 
-  // ── Manual refresh button ────────────────────────────────────────────────
-  const handleRefresh = useCallback(() => { runProbe(); }, [runProbe]);
+  // ── Manual Refresh Connection button ─────────────────────────────────────
+  const handleRefresh = useCallback(() => {
+    runProbe({ resetThreshold: false });
+  }, [runProbe]);
 
-  // ── Computed style values ────────────────────────────────────────────────
+  // ── Computed style values (unchanged from previous version) ──────────────
   const iconBg     = justRecovered ? "#ecfdf5" : "#fef2f2";
   const iconBorder = justRecovered ? "#6ee7b7" : "#fecaca";
   const btnBg      = checking
@@ -173,12 +242,12 @@ export default function OfflinePopup() {
     : "linear-gradient(135deg, var(--brand, #146c94) 0%, var(--brand-strong, #0b4f6c) 100%)";
   const btnColor   = checking ? "var(--muted, #657184)" : "#ffffff";
 
-  // ── Render ────────────────────────────────────────────────────────────────
+  // ── Render (JSX unchanged from previous version) ─────────────────────────
   return (
     <AnimatePresence>
       {isOffline && (
         <>
-          {/* ── Backdrop ─────────────────────────────────────────────────── */}
+          {/* Backdrop */}
           <motion.div
             key="offline-backdrop"
             initial={{ opacity: 0 }}
@@ -197,15 +266,9 @@ export default function OfflinePopup() {
           />
 
           {/*
-           * ── Centering wrapper ──────────────────────────────────────────
-           * FIX: framer-motion overwrites the CSS `transform` property on
-           * every animation frame when scale/y are animated.  Placing
-           * `transform: translate(-50%,-50%)` on the motion.div is silently
-           * discarded, sending the card off-screen.
-           *
-           * Solution: use a static fixed full-viewport flexbox div to centre
-           * the card.  The motion.div card has NO position/transform of its
-           * own — framer-motion can animate scale and y freely.
+           * Centering wrapper — framer-motion overwrites `transform` on every
+           * animation frame, so we use a flexbox parent for centering instead
+           * of transform:translate(-50%,-50%) on the motion.div card.
            */}
           <div
             style={{
@@ -215,10 +278,10 @@ export default function OfflinePopup() {
               alignItems: "center",
               justifyContent: "center",
               zIndex: 9999,
-              pointerEvents: "none", // let clicks pass through to the backdrop
+              pointerEvents: "none",
             }}
           >
-            {/* ── Modal card ─────────────────────────────────────────────── */}
+            {/* Modal card */}
             <motion.div
               key="offline-modal"
               role="alertdialog"
@@ -230,7 +293,7 @@ export default function OfflinePopup() {
               exit={{ opacity: 0, scale: 0.88, y: 24 }}
               transition={{ type: "spring", stiffness: 340, damping: 28 }}
               style={{
-                /* No position / transform here — centred by the parent flex */
+                /* No position / transform — centred by parent flexbox */
                 width: "min(92vw, 420px)",
                 background: "var(--panel, #ffffff)",
                 borderRadius: "20px",
@@ -238,7 +301,7 @@ export default function OfflinePopup() {
                   "0 24px 64px rgba(15,23,42,0.22), 0 4px 16px rgba(15,23,42,0.10)",
                 overflow: "hidden",
                 fontFamily: "Inter, ui-sans-serif, system-ui, sans-serif",
-                pointerEvents: "auto", // card itself is interactive
+                pointerEvents: "auto",
               }}
             >
               {/* Top accent stripe */}
