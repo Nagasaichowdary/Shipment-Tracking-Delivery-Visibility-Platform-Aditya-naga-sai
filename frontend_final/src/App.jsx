@@ -3,6 +3,7 @@ import { BrowserRouter, Navigate, Route, Routes } from "react-router-dom";
 import "./App.css";
 import Navbar from "./assets/components/layout/Navbar";
 import Sidebar from "./assets/components/layout/Sidebar";
+import OfflinePopup from "./assets/components/layout/OfflinePopup";
 import { AuthContext } from "./assets/context/auth";
 import { AuthProvider } from "./assets/context/AuthContext";
 import { ShipmentProvider } from "./assets/context/ShipmentContext";
@@ -172,6 +173,7 @@ function App() {
           <Route path="/*" element={<AppLayout />} />
         </Routes>
       </BrowserRouter>
+      <OfflinePopup />
     </AuthProvider>
   );
 }
